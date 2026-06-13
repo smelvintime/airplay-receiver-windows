@@ -40,12 +40,19 @@ public sealed unsafe class VideoPresenter : IDisposable
     private SamplerState                _sampler     = null!;
     private ShaderResourceView?         _lumaView;
     private ShaderResourceView?         _chromaView;
-    private Texture2D?                  _stagingTex; // for software-decoded frames
+    private Texture2D?                  _yTex;       // NV12 luma  (R8)
+    private Texture2D?                  _uvTex;      // NV12 chroma (R8G8, half res)
+
+    // Serialises immediate-context use between the decode thread (PresentFrame)
+    // and the UI thread (Resize).
+    private readonly object _renderLock = new();
 
     // ── State ─────────────────────────────────────────────────────────────────
 
     private int _swapChainWidth;
     private int _swapChainHeight;
+    private int _frameWidth;
+    private int _frameHeight;
 
     // ── Initialisation ────────────────────────────────────────────────────────
 
@@ -135,35 +142,40 @@ public sealed unsafe class VideoPresenter : IDisposable
     public void PresentFrame(IntPtr framePtr)
     {
         AVFrame* frame = (AVFrame*)framePtr;
+        int w = frame->width;
+        int h = frame->height;
+        if (w <= 0 || h <= 0) return;
 
-        // The D3D11VA frame has:
-        //   frame->data[0] = (uint8_t*)ID3D11Texture2D*
-        //   frame->data[1] = (uint8_t*)(uintptr_t)arrayIndex
-        var tex2D = (ID3D11Texture2D*)(void*)frame->data[0];
-        int slice  = (int)(nint)(void*)frame->data[1];
+        // CPU NV12: data[0] = Y plane (linesize[0]), data[1] = interleaved UV (linesize[1]).
+        IntPtr yPtr  = (IntPtr)frame->data[0];
+        int    yPitch  = frame->linesize[0];
+        IntPtr uvPtr = (IntPtr)frame->data[1];
+        int    uvPitch = frame->linesize[1];
+        if (yPtr == IntPtr.Zero || uvPtr == IntPtr.Zero) return;
 
-        // Create (or recreate) SRVs for the Y and UV planes of the NV12 texture.
-        UpdateNv12Views(tex2D, slice, frame->width, frame->height);
+        lock (_renderLock)
+        {
+            EnsureNv12Textures(w, h);
 
-        // ── Render ────────────────────────────────────────────────────────────
-        _context.OutputMerger.SetRenderTargets(_rtv);
-        _context.ClearRenderTargetView(_rtv, new RawColor4(0, 0, 0, 1));
+            // Upload the planes (source row pitch = FFmpeg linesize, which may be padded).
+            _context.UpdateSubresource(new DataBox(yPtr,  yPitch,  yPitch  * h),       _yTex!,  0);
+            _context.UpdateSubresource(new DataBox(uvPtr, uvPitch, uvPitch * (h / 2)), _uvTex!, 0);
 
-        _context.VertexShader.Set(_vs);
-        _context.PixelShader.Set(_ps);
-        _context.PixelShader.SetSampler(0, _sampler);
+            _context.OutputMerger.SetRenderTargets(_rtv);
+            _context.ClearRenderTargetView(_rtv, new RawColor4(0, 0, 0, 1));
 
-        if (_lumaView is not null)
+            _context.VertexShader.Set(_vs);
+            _context.PixelShader.Set(_ps);
+            _context.PixelShader.SetSampler(0, _sampler);
             _context.PixelShader.SetShaderResource(0, _lumaView);
-        if (_chromaView is not null)
             _context.PixelShader.SetShaderResource(1, _chromaView);
 
-        // Full-screen triangle (no vertex buffer needed — VS generates from SV_VertexID)
-        _context.InputAssembler.PrimitiveTopology = PrimitiveTopology.TriangleList;
-        _context.Draw(3, 0);
+            // Full-screen triangle (VS generates positions from SV_VertexID).
+            _context.InputAssembler.PrimitiveTopology = PrimitiveTopology.TriangleList;
+            _context.Draw(3, 0);
 
-        // Present vsync-locked (1 interval = wait for next vblank)
-        _swapChain.Present(1, PresentFlags.None);
+            _swapChain.Present(1, PresentFlags.None);
+        }
     }
 
     // ── Resize ────────────────────────────────────────────────────────────────
@@ -173,19 +185,22 @@ public sealed unsafe class VideoPresenter : IDisposable
         if (width == _swapChainWidth && height == _swapChainHeight) return;
         if (width <= 0 || height <= 0) return;
 
-        _rtv.Dispose();
+        lock (_renderLock)
+        {
+            _rtv.Dispose();
 
-        _swapChain.ResizeBuffers(
-            bufferCount: 2,
-            width, height,
-            Format.B8G8R8A8_UNorm,
-            SwapChainFlags.None);
+            _swapChain.ResizeBuffers(
+                bufferCount: 2,
+                width, height,
+                Format.B8G8R8A8_UNorm,
+                SwapChainFlags.None);
 
-        _swapChainWidth  = width;
-        _swapChainHeight = height;
+            _swapChainWidth  = width;
+            _swapChainHeight = height;
 
-        CreateRenderTargetView();
-        _context.Rasterizer.SetViewport(0, 0, width, height);
+            CreateRenderTargetView();
+            _context.Rasterizer.SetViewport(0, 0, width, height);
+        }
 
         System.Diagnostics.Debug.WriteLine($"[Renderer] Resized to {width}×{height}");
     }
@@ -214,16 +229,41 @@ public sealed unsafe class VideoPresenter : IDisposable
         _rtv = new RenderTargetView(_device, backBuffer);
     }
 
-    private void UpdateNv12Views(ID3D11Texture2D* tex2D, int slice, int width, int height)
+    /// <summary>
+    /// (Re)creates the NV12 upload textures and their SRVs when the frame size
+    /// changes: an R8 luma texture (full res) and an R8G8 chroma texture (half res).
+    /// </summary>
+    private void EnsureNv12Textures(int width, int height)
     {
-        // TODO: Create SRVs for luma (R8) and chroma (RG8) planes.
-        // This requires marshalling the native ID3D11Texture2D* into SharpDX.
-        // Full implementation:
-        //   var sharpTex = new Texture2D((IntPtr)tex2D);
-        //   _lumaView   = new ShaderResourceView(_device, sharpTex, lumaDesc);
-        //   _chromaView = new ShaderResourceView(_device, sharpTex, chromaDesc);
-        // where lumaDesc.Format = R8_UNorm, chromaDesc.Format = R8G8_UNorm
-        // and both include the array slice index.
+        if (_yTex is not null && _frameWidth == width && _frameHeight == height)
+            return;
+
+        _lumaView?.Dispose();
+        _chromaView?.Dispose();
+        _yTex?.Dispose();
+        _uvTex?.Dispose();
+
+        _yTex = new Texture2D(_device, new Texture2DDescription
+        {
+            Width = width, Height = height, MipLevels = 1, ArraySize = 1,
+            Format = Format.R8_UNorm, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+            CpuAccessFlags = CpuAccessFlags.None, OptionFlags = ResourceOptionFlags.None,
+        });
+        _uvTex = new Texture2D(_device, new Texture2DDescription
+        {
+            Width = (width + 1) / 2, Height = (height + 1) / 2, MipLevels = 1, ArraySize = 1,
+            Format = Format.R8G8_UNorm, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+            CpuAccessFlags = CpuAccessFlags.None, OptionFlags = ResourceOptionFlags.None,
+        });
+
+        _lumaView   = new ShaderResourceView(_device, _yTex);
+        _chromaView = new ShaderResourceView(_device, _uvTex);
+        _frameWidth  = width;
+        _frameHeight = height;
+
+        System.Diagnostics.Debug.WriteLine($"[Renderer] NV12 textures {width}×{height}");
     }
 
     private void CompileShaders()
@@ -286,7 +326,8 @@ public sealed unsafe class VideoPresenter : IDisposable
     {
         _lumaView?.Dispose();
         _chromaView?.Dispose();
-        _stagingTex?.Dispose();
+        _yTex?.Dispose();
+        _uvTex?.Dispose();
         _sampler.Dispose();
         _ps.Dispose();
         _vs.Dispose();

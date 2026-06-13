@@ -231,11 +231,29 @@ public sealed class VideoDecoder : IDisposable
                                   $"fmt={_frame->format}  hw={(AVPixelFormat)_frame->format == AVPixelFormat.AV_PIX_FMT_D3D11}");
             }
 
+            // The decoded frame is a D3D11 hardware surface on FFmpeg's own device.
+            // Copy it down to a CPU NV12 frame so the presenter (a different D3D11
+            // device) can upload and render it without cross-device texture sharing.
+            AVFrame* outFrame   = _frame;
+            bool     transferred = false;
+            if ((AVPixelFormat)_frame->format == AVPixelFormat.AV_PIX_FMT_D3D11)
+            {
+                int tr = ffmpeg.av_hwframe_transfer_data(_swFrame, _frame, 0);
+                if (tr < 0)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[Decoder] av_hwframe_transfer_data error: {tr}");
+                    ffmpeg.av_frame_unref(_frame);
+                    continue;
+                }
+                outFrame    = _swFrame;
+                transferred = true;
+            }
+
             // Invoke the render callback (VideoPresenter). The pointer is passed
             // as an IntPtr because Action<> can't take a pointer type argument.
-            _onFrame((IntPtr)_frame);
+            _onFrame((IntPtr)outFrame);
 
-            // Unref immediately so FFmpeg can recycle the HW texture
+            if (transferred) ffmpeg.av_frame_unref(_swFrame);
             ffmpeg.av_frame_unref(_frame);
         }
     }
