@@ -58,6 +58,9 @@ public sealed class PairingHandler
     public byte[]? AesKey { get; private set; }
     public byte[]? AesIv  { get; private set; }
 
+    /// <summary>The X25519 shared secret from pair-verify, reused to derive the mirror stream key.</summary>
+    public byte[]? EcdhSecret { get; private set; }
+
     public PairingHandler(DeviceIdentity identity) => _identity = identity;
 
     // ── /pair-setup ───────────────────────────────────────────────────────────
@@ -110,6 +113,7 @@ public sealed class PairingHandler
         agreement.Init(serverPriv);
         byte[] shared = new byte[agreement.AgreementSize];
         agreement.CalculateAgreement(new X25519PublicKeyParameters(_clientCurvePub, 0), shared, 0);
+        EcdhSecret = shared;
 
         _verifyAesKey = DeriveKey(SaltKey, shared);
         _verifyAesIv  = DeriveKey(SaltIv,  shared);
