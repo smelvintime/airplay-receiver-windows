@@ -4,6 +4,7 @@ using SharpDX;
 using SharpDX.Direct3D;
 using SharpDX.Direct3D11;
 using SharpDX.DXGI;
+using SharpDX.Mathematics.Interop;
 using System;
 using System.Runtime.InteropServices;
 using WinRT;
@@ -66,7 +67,10 @@ public sealed unsafe class VideoPresenter : IDisposable
         int initialWidth  = Math.Max(1, (int)panel.ActualWidth);
         int initialHeight = Math.Max(1, (int)panel.ActualHeight);
 
-        SharpDX.Direct3D11.Device.CreateWithSwapChain(
+        // Create the D3D11 device first (no swap chain). A SwapChainPanel needs a
+        // *composition* swap chain (IDXGIFactory2::CreateSwapChainForComposition),
+        // not the HWND-bound swap chain that Device.CreateWithSwapChain produces.
+        var device = new SharpDX.Direct3D11.Device(
             DriverType.Hardware,
             flags,
             new[]
@@ -74,17 +78,18 @@ public sealed unsafe class VideoPresenter : IDisposable
                 SharpDX.Direct3D.FeatureLevel.Level_11_1,
                 SharpDX.Direct3D.FeatureLevel.Level_11_0,
                 SharpDX.Direct3D.FeatureLevel.Level_10_1,
-            },
-            BuildSwapChainDesc(initialWidth, initialHeight),
-            out SharpDX.Direct3D11.Device device,
-            out SwapChain swapChain);
+            });
 
         _device  = device;
         _context = device.ImmediateContext;
 
-        // ── Upgrade to IDXGISwapChain1 ────────────────────────────────────────
-        _swapChain = swapChain.QueryInterface<SwapChain1>();
-        swapChain.Dispose();
+        // ── Composition swap chain bound to the DXGI factory ──────────────────
+        using var dxgiDevice = device.QueryInterface<SharpDX.DXGI.Device2>();
+        using var adapter    = dxgiDevice.Adapter;
+        using var factory    = adapter.GetParent<SharpDX.DXGI.Factory2>();
+
+        var swapChainDesc = BuildSwapChainDesc(initialWidth, initialHeight);
+        _swapChain = new SwapChain1(factory, device, ref swapChainDesc);
 
         // ── Bind swap chain to SwapChainPanel ─────────────────────────────────
         // SwapChainPanel implements ISwapChainPanelNative (via WinRT interop).
@@ -142,7 +147,7 @@ public sealed unsafe class VideoPresenter : IDisposable
 
         // ── Render ────────────────────────────────────────────────────────────
         _context.OutputMerger.SetRenderTargets(_rtv);
-        _context.ClearRenderTargetView(_rtv, new Color4(0, 0, 0, 1));
+        _context.ClearRenderTargetView(_rtv, new RawColor4(0, 0, 0, 1));
 
         _context.VertexShader.Set(_vs);
         _context.PixelShader.Set(_ps);
