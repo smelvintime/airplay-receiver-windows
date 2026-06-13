@@ -28,8 +28,10 @@ public sealed class DeviceInfo
     /// <summary>Persistent device GUID string.</summary>
     public string Pi { get; init; } = "";
 
-    // Mirror display geometry advertised to iOS.
-    public int DisplayWidth  { get; init; } = 1920;
-    public int DisplayHeight { get; init; } = 1080;
+    // Mirror display geometry advertised to iOS. A larger box lets iOS encode at
+    // higher resolution (it fits the phone's screen inside this, preserving aspect),
+    // which improves sharpness in both orientations.
+    public int DisplayWidth  { get; init; } = 2560;
+    public int DisplayHeight { get; init; } = 1440;
     public int MaxFps        { get; init; } = 60;
 }
