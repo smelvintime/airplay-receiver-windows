@@ -157,6 +157,11 @@ public sealed class AirPlaySession : IAsyncDisposable
     private byte[] HandleRecord(RtspMessage msg)
     {
         // iOS sends RECORD to begin the RTP stream.
+        // If pairing produced AES-CBC keys, hand them to the RTP receiver before
+        // the stream starts; otherwise it runs in cleartext passthrough mode.
+        if (_pairing.AesKey is { } key && _pairing.AesIv is { } iv)
+            _rtpReceiver.SetDecryptionKeys(key, iv);
+
         _isRecording = true;
         _ = _rtpReceiver.StartAsync();
         StreamStarted?.Invoke();

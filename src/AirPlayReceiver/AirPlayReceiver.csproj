@@ -11,6 +11,10 @@
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <UseWinUI>true</UseWinUI>
     <EnableMsixTooling>true</EnableMsixTooling>
+    <!-- Run unpackaged (plain .exe) so the receiver can bind the fixed AirPlay
+         ports (7000/7011) without the loopback/network restrictions that apply
+         inside an MSIX AppContainer. -->
+    <WindowsPackageType>None</WindowsPackageType>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -29,10 +33,11 @@
     <!-- FFmpeg bindings -->
     <PackageReference Include="FFmpeg.AutoGen" Version="6.1.0" />
 
-    <!-- DirectX interop (swap chain, textures) -->
+    <!-- DirectX interop (swap chain, textures, runtime shader compile) -->
     <PackageReference Include="SharpDX" Version="4.2.0" />
     <PackageReference Include="SharpDX.Direct3D11" Version="4.2.0" />
     <PackageReference Include="SharpDX.DXGI" Version="4.2.0" />
+    <PackageReference Include="SharpDX.D3DCompiler" Version="4.2.0" />
 
     <!-- Cryptography: SRP-6a, Ed25519, Curve25519 -->
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.3.0" />
@@ -41,6 +46,13 @@
   <!-- Native FFmpeg DLLs — place in native\x64\ -->
   <ItemGroup>
     <Content Include="native\x64\*.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- App assets: window/idle icons. Copied next to the exe for XAML Image refs. -->
+  <ItemGroup>
+    <Content Include="Assets\**\*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

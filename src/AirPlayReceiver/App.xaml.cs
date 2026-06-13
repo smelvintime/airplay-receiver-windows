@@ -25,7 +25,8 @@ public partial class App : Application
         _window.Activate();
 
         // Boot the AirPlay service stack (mDNS + RTSP server).
-        _airPlayService = new AirPlayService(_window.VideoPresenter);
+        // Pass the window so the decoder/session can drive the HUD and overlays.
+        _airPlayService = new AirPlayService(_window.VideoPresenter, _window);
         await _airPlayService.StartAsync();
 
         _window.Closed += async (_, _) =>

@@ -91,7 +91,7 @@ public sealed class AirPlayService : IAsyncDisposable
         var session = new AirPlaySession(_rtpReceiver!, pairing);
 
         session.StreamStarted += () => _window?.OnSessionStarted();
-        session.StreamEnded   += () => _window?.OnSessionEnded();
+        session.StreamStopped += () => _window?.OnSessionEnded();
 
         return session;
     }
