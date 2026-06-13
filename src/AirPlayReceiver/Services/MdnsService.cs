@@ -1,8 +1,5 @@
 using Makaretu.Dns;
 using Makaretu.Dns.Resolving;
-using Org.BouncyCastle.Crypto.Generators;
-using Org.BouncyCastle.Crypto.Parameters;
-using Org.BouncyCastle.Security;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -58,13 +55,14 @@ public sealed class MdnsService : IAsyncDisposable
     // ── Construction ──────────────────────────────────────────────────────────
 
     /// <param name="deviceName">Friendly name shown in the Screen Mirroring list.</param>
+    /// <param name="publicKeyHex">The receiver's Ed25519 public key (hex) for the <c>pk</c> TXT record.</param>
     /// <param name="port">TCP port the RTSP server listens on (default 7000).</param>
-    public MdnsService(string deviceName, int port = 7000)
+    public MdnsService(string deviceName, string publicKeyHex, int port = 7000)
     {
         _deviceName   = deviceName;
         _port         = port;
         _deviceId     = GetMacAddress();
-        _publicKeyHex = GenerateEd25519PublicKeyHex();
+        _publicKeyHex = publicKeyHex;
 
         _mdns = new MulticastService();
         _sd   = new ServiceDiscovery(_mdns);
@@ -230,23 +228,5 @@ public sealed class MdnsService : IAsyncDisposable
     {
         string hex = mac.Replace(":", "").ToLowerInvariant().PadRight(32, '0');
         return $"{hex[..8]}-{hex[8..12]}-{hex[12..16]}-{hex[16..20]}-{hex[20..32]}";
-    }
-
-    /// <summary>
-    /// Generates a random Ed25519 public key and returns it as a 64-char hex
-    /// string for the <c>pk</c> TXT record. iOS reads this during discovery and
-    /// pair-verify; an all-zero placeholder can cause iOS to ignore the device.
-    ///
-    /// NOTE: this is currently generated fresh per run. When real pairing lands,
-    /// this keypair must be the same identity PairingHandler signs with, and
-    /// should be persisted so the device keeps a stable identity across restarts.
-    /// </summary>
-    private static string GenerateEd25519PublicKeyHex()
-    {
-        var generator = new Ed25519KeyPairGenerator();
-        generator.Init(new Ed25519KeyGenerationParameters(new SecureRandom()));
-        var keyPair = generator.GenerateKeyPair();
-        var publicKey = (Ed25519PublicKeyParameters)keyPair.Public;
-        return Convert.ToHexString(publicKey.GetEncoded()).ToLowerInvariant();
     }
 }
