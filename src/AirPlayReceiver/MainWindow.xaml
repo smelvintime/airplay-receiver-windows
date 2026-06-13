@@ -19,7 +19,7 @@
             Margins are set in code-behind to letterbox while preserving aspect ratio.
         -->
         <SwapChainPanel
-            x:Name="VideoPresenter"
+            x:Name="VideoSurface"
             HorizontalAlignment="Center"
             VerticalAlignment="Center"
             DoubleTapped="VideoPresenter_DoubleTapped" />

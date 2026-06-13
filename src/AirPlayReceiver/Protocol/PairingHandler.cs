@@ -85,9 +85,11 @@ public sealed class PairingHandler
     {
         Console.WriteLine("[Pairing] /pair-verify received (stub — returning 200 OK)");
 
-        // Stub: set placeholder keys so the rest of the pipeline can run.
-        AesKey = new byte[16]; // all-zero placeholder
-        AesIv  = new byte[16];
+        // Stub: leave AesKey/AesIv null. The real exchange (Curve25519 ECDH +
+        // SHA-512 key derivation) must populate them; until then RtpReceiver
+        // stays in its cleartext passthrough mode rather than decrypting with a
+        // bogus all-zero key. When this is implemented, AirPlaySession picks the
+        // keys up and hands them to RtpReceiver before RECORD starts the stream.
 
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
             new Dictionary<string, string>

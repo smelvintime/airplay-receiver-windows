@@ -21,7 +21,11 @@ public sealed partial class MainWindow : Window
     // ── Public surface ────────────────────────────────────────────────────────
 
     /// <summary>The SwapChainPanel that receives rendered video frames.</summary>
-    public Microsoft.UI.Xaml.Controls.SwapChainPanel VideoPresenter => _videoPresenter;
+    /// <remarks>
+    /// Backed by the <c>x:Name="VideoSurface"</c> element. The name is kept
+    /// distinct from this property so the XAML-generated field doesn't collide.
+    /// </remarks>
+    public Microsoft.UI.Xaml.Controls.SwapChainPanel VideoPresenter => VideoSurface;
 
     // ── Private state ─────────────────────────────────────────────────────────
 
@@ -53,15 +57,7 @@ public sealed partial class MainWindow : Window
 
         // ── Layout ───────────────────────────────────────────────────────────
         RootGrid.SizeChanged += RootGrid_SizeChanged;
-
-        // Expose a SwapChainPanel reference under the expected field name
-        // so XAML x:Name binding is accessible here.
-        _videoPresenter = VideoPresenter;
     }
-
-    // XAML x:Name back-reference (compiler generates field for x:Name="VideoPresenter"
-    // but we alias it so code is self-documenting).
-    private readonly Microsoft.UI.Xaml.Controls.SwapChainPanel _videoPresenter;
 
     // ── Custom title bar ──────────────────────────────────────────────────────
 
