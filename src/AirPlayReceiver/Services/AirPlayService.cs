@@ -62,7 +62,7 @@ public sealed class AirPlayService : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[AirPlay] Video decoder unavailable: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[AirPlay] Video decoder unavailable: {ex.Message}");
             _window?.UpdateHud("Video decoding unavailable — FFmpeg DLLs missing (ARCHITECTURE.md §5)");
             _decoder     = null;
             _rtpReceiver = null;
@@ -78,7 +78,7 @@ public sealed class AirPlayService : IAsyncDisposable
         _mdns = new MdnsService(deviceName, port: 7000);
         await _mdns.StartAsync(ct);
 
-        Console.WriteLine($"[AirPlay] Service started. Advertising as '{deviceName}'");
+        System.Diagnostics.Debug.WriteLine($"[AirPlay] Service started. Advertising as '{deviceName}'");
     }
 
     public async Task StopAsync()
@@ -90,7 +90,7 @@ public sealed class AirPlayService : IAsyncDisposable
         _presenter?.Dispose();
         _decoder?.Dispose();
 
-        Console.WriteLine("[AirPlay] Service stopped.");
+        System.Diagnostics.Debug.WriteLine("[AirPlay] Service stopped.");
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
@@ -111,10 +111,10 @@ public sealed class AirPlayService : IAsyncDisposable
     // ── Event handlers ────────────────────────────────────────────────────────
 
     private void OnSessionStarted(AirPlaySession session)
-        => Console.WriteLine("[AirPlay] Session started.");
+        => System.Diagnostics.Debug.WriteLine("[AirPlay] Session started.");
 
     private void OnSessionEnded(AirPlaySession session)
-        => Console.WriteLine("[AirPlay] Session ended.");
+        => System.Diagnostics.Debug.WriteLine("[AirPlay] Session ended.");
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

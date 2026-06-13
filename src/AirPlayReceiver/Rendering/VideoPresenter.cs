@@ -123,7 +123,7 @@ public sealed unsafe class VideoPresenter : IDisposable
         panel.SizeChanged += (_, e) =>
             Resize((int)e.NewSize.Width, (int)e.NewSize.Height);
 
-        Console.WriteLine($"[Renderer] Initialized {_swapChainWidth}×{_swapChainHeight}");
+        System.Diagnostics.Debug.WriteLine($"[Renderer] Initialized {_swapChainWidth}×{_swapChainHeight}");
     }
 
     // ── Frame presentation ────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ public sealed unsafe class VideoPresenter : IDisposable
         CreateRenderTargetView();
         _context.Rasterizer.SetViewport(0, 0, width, height);
 
-        Console.WriteLine($"[Renderer] Resized to {width}×{height}");
+        System.Diagnostics.Debug.WriteLine($"[Renderer] Resized to {width}×{height}");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

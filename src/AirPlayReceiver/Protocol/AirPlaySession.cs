@@ -61,7 +61,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             RtspMessage? msg = await RtspMessage.ReadAsync(stream, ct);
             if (msg is null) break; // client closed connection
 
-            Console.WriteLine($"[RTSP→] {msg}");
+            System.Diagnostics.Debug.WriteLine($"[RTSP→] {msg}");
 
             byte[] response = msg.Method switch
             {
@@ -76,7 +76,7 @@ public sealed class AirPlaySession : IAsyncDisposable
                 _               => BuildOk(msg.CSeq),
             };
 
-            Console.WriteLine($"[RTSP←] {response.Length}B");
+            System.Diagnostics.Debug.WriteLine($"[RTSP←] {response.Length}B");
             await stream.WriteAsync(response, ct);
 
             if (msg.Method == "TEARDOWN") break;
@@ -191,7 +191,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandleTeardown(RtspMessage msg)
     {
-        Console.WriteLine("[RTSP] TEARDOWN received.");
+        System.Diagnostics.Debug.WriteLine("[RTSP] TEARDOWN received.");
         return BuildOk(msg.CSeq);
     }
 

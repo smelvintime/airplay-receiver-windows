@@ -51,7 +51,7 @@ public sealed class PairingHandler
     /// </summary>
     public byte[] HandlePairSetup(RtspMessage msg)
     {
-        Console.WriteLine("[Pairing] /pair-setup received (stub — returning 200 OK)");
+        System.Diagnostics.Debug.WriteLine("[Pairing] /pair-setup received (stub — returning 200 OK)");
 
         // Stub: return an empty 200 so iOS proceeds.
         // Real implementation must parse the TLV8 state field and respond
@@ -83,7 +83,7 @@ public sealed class PairingHandler
     /// </summary>
     public byte[] HandlePairVerify(RtspMessage msg)
     {
-        Console.WriteLine("[Pairing] /pair-verify received (stub — returning 200 OK)");
+        System.Diagnostics.Debug.WriteLine("[Pairing] /pair-verify received (stub — returning 200 OK)");
 
         // Stub: leave AesKey/AesIv null. The real exchange (Curve25519 ECDH +
         // SHA-512 key derivation) must populate them; until then RtpReceiver
@@ -107,7 +107,7 @@ public sealed class PairingHandler
     /// </summary>
     public byte[] HandlePairAdd(RtspMessage msg)
     {
-        Console.WriteLine("[Pairing] /pair-add (stub)");
+        System.Diagnostics.Debug.WriteLine("[Pairing] /pair-add (stub)");
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq);
     }
 
@@ -121,7 +121,7 @@ public sealed class PairingHandler
     /// </summary>
     public byte[] HandleFairPlaySetup(RtspMessage msg)
     {
-        Console.WriteLine("[Pairing] /fp-setup — returning 421 (not implemented)");
+        System.Diagnostics.Debug.WriteLine("[Pairing] /fp-setup — returning 421 (not implemented)");
         return RtspMessage.BuildResponse(421, "Misdirected Request", msg.CSeq);
     }
 }
