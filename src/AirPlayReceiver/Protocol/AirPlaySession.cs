@@ -2,6 +2,8 @@ using AirPlayReceiver.Media;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -36,9 +38,15 @@ public sealed class AirPlaySession : IAsyncDisposable
     // ── Session state ─────────────────────────────────────────────────────────
 
     private bool   _isRecording;
-    private int    _videoDataPort;   // UDP port for RTP video (set in SETUP)
-    private int    _videoControlPort;
     private string _sessionId = Guid.NewGuid().ToString("N")[..8];
+
+    // ── AirPlay 2 mirroring media state (set up during SETUP) ─────────────────
+    private MirrorStreamReceiver? _mirror;        // TCP video stream
+    private TcpListener?          _eventListener; // event channel (accept + ignore)
+    private UdpClient?            _timing;        // timing/NTP channel (minimal)
+    private byte[]?               _streamEkey;    // FairPlay-encrypted stream key (from SETUP)
+    private byte[]?               _streamEiv;     // stream AES IV (from SETUP)
+    private long                  _streamConnectionId;
 
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -123,35 +131,118 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandleSetup(RtspMessage msg)
     {
-        // The SETUP body is a binary plist (AirPlay 2) or custom TLV (AirPlay 1)
-        // that describes the requested stream type and the client's RTP ports.
-        //
-        // Simplified handling: extract client's video data port from the
-        // "Transport" header (AirPlay 1 style) as a starting point.
-        // Full AirPlay 2 requires parsing the binary plist body.
-        //
-        // Transport header example:
-        //   RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;
-        //   control_port=6001;timing_port=6002
+        // AirPlay 2 SETUP carries a binary plist and happens in (up to) two phases
+        // on the same RTSP connection:
+        //   phase 1 — has "ekey"/"eiv" + "timingPort"; we reply eventPort/timingPort
+        //   phase 2 — has a "streams" array (type 110 = mirroring); we open a TCP
+        //             data port and reply with it.
+        // A single request may also contain both.
+        byte[] body = msg.Body ?? Array.Empty<byte>();
 
-        if (msg.Headers.TryGetValue("Transport", out string? transport))
+        object? parsed;
+        try { parsed = BinaryPlist.Parse(body); }
+        catch (Exception ex)
         {
-            ParseTransportHeader(transport);
+            System.Diagnostics.Debug.WriteLine($"[Setup] plist parse failed: {ex.Message}");
+            return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq);
         }
 
-        // Choose our server-side ports (defaults when the RTP receiver is absent).
-        int serverDataPort    = _rtpReceiver?.VideoDataPort    ?? 7011;
-        int serverControlPort = _rtpReceiver?.VideoControlPort ?? 7012;
+        if (parsed is not Dictionary<string, object?> root)
+            return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq);
 
+        var response = new Dictionary<string, object?>();
+
+        // ── Phase 1: key + timing setup ───────────────────────────────────────
+        if (root.TryGetValue("ekey", out var ekeyObj) && ekeyObj is byte[] ekey &&
+            root.TryGetValue("eiv",  out var eivObj)  && eivObj  is byte[] eiv)
+        {
+            _streamEkey = ekey;
+            _streamEiv  = eiv;
+            System.Diagnostics.Debug.WriteLine($"[Setup] phase 1: ekey={ekey.Length}B eiv={eiv.Length}B");
+
+            int eventPort  = OpenEventChannel();
+            int timingPort = OpenTimingChannel();
+            response["eventPort"]  = (long)eventPort;
+            response["timingPort"] = (long)timingPort;
+        }
+
+        // ── Phase 2: stream setup ─────────────────────────────────────────────
+        if (root.TryGetValue("streams", out var streamsObj) && streamsObj is List<object?> streams)
+        {
+            var responseStreams = new List<object?>();
+            foreach (var streamObj in streams)
+            {
+                if (streamObj is not Dictionary<string, object?> stream) continue;
+                long type = stream.TryGetValue("type", out var t) && t is long tl ? tl : -1;
+                System.Diagnostics.Debug.WriteLine($"[Setup] phase 2: stream type={type}");
+
+                if (type == 110) // video mirroring
+                {
+                    _streamConnectionId =
+                        stream.TryGetValue("streamConnectionID", out var c) && c is long cl ? cl : 0;
+
+                    _mirror = new MirrorStreamReceiver();
+                    _mirror.Start();
+
+                    responseStreams.Add(new Dictionary<string, object?>
+                    {
+                        ["type"]     = (long)110,
+                        ["dataPort"] = (long)_mirror.Port,
+                    });
+                }
+            }
+            response["streams"] = responseStreams;
+        }
+
+        byte[] responseBody = BinaryPlist.Write(response);
         var headers = new Dictionary<string, string>
         {
-            ["Transport"] = $"RTP/AVP/UDP;unicast;mode=record;" +
-                            $"server_port={serverDataPort};" +
-                            $"control_port={serverControlPort}",
-            ["Session"]   = _sessionId,
+            ["Content-Type"] = "application/x-apple-binary-plist",
         };
+        return RtspMessage.BuildResponse(200, "OK", msg.CSeq, headers, responseBody);
+    }
 
-        return RtspMessage.BuildResponse(200, "OK", msg.CSeq, headers);
+    /// <summary>Opens a TCP listener for the iOS event channel that accepts and drains (we don't act on events yet).</summary>
+    private int OpenEventChannel()
+    {
+        _eventListener = new TcpListener(IPAddress.Any, 0);
+        _eventListener.Start();
+        int port = ((IPEndPoint)_eventListener.LocalEndpoint).Port;
+        _ = AcceptAndDrainEventsAsync(_eventListener);
+        System.Diagnostics.Debug.WriteLine($"[Setup] event channel on TCP {port}");
+        return port;
+    }
+
+    private static async Task AcceptAndDrainEventsAsync(TcpListener listener)
+    {
+        try
+        {
+            while (true)
+            {
+                var client = await listener.AcceptTcpClientAsync();
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        using var c = client;
+                        using var s = c.GetStream();
+                        var buf = new byte[4096];
+                        while (await s.ReadAsync(buf) > 0) { /* drain event channel */ }
+                    }
+                    catch { /* ignore */ }
+                });
+            }
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException) { }
+    }
+
+    /// <summary>Opens a UDP socket for the timing/NTP channel (port is reported to iOS; NTP not yet implemented).</summary>
+    private int OpenTimingChannel()
+    {
+        _timing = new UdpClient(0);
+        int port = ((IPEndPoint)_timing.Client.LocalEndPoint!).Port;
+        System.Diagnostics.Debug.WriteLine($"[Setup] timing channel on UDP {port}");
+        return port;
     }
 
     private byte[] HandleRecord(RtspMessage msg)
@@ -203,16 +294,6 @@ public sealed class AirPlaySession : IAsyncDisposable
     private static byte[] BuildOk(int cseq)
         => RtspMessage.BuildResponse(200, "OK", cseq);
 
-    private void ParseTransportHeader(string transport)
-    {
-        foreach (string part in transport.Split(';'))
-        {
-            string p = part.Trim();
-            if (p.StartsWith("control_port=", StringComparison.OrdinalIgnoreCase))
-                int.TryParse(p[13..], out _videoControlPort);
-        }
-    }
-
     private async Task StopStreamAsync()
     {
         if (_isRecording)
@@ -222,6 +303,17 @@ public sealed class AirPlaySession : IAsyncDisposable
                 await _rtpReceiver.StopAsync();
             StreamStopped?.Invoke();
         }
+
+        // Tear down AirPlay 2 mirroring media (set up during SETUP).
+        if (_mirror is not null)
+        {
+            await _mirror.StopAsync();
+            _mirror = null;
+        }
+        _eventListener?.Stop();
+        _eventListener = null;
+        _timing?.Dispose();
+        _timing = null;
     }
 
     public async ValueTask DisposeAsync() => await StopStreamAsync();
