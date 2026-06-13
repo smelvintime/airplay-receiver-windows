@@ -51,9 +51,9 @@ public sealed class AirPlayService : IAsyncDisposable
         try
         {
             _decoder = new VideoDecoder(
-                onFrame:      frame  => _presenter.PresentFrame(frame),
-                onDimensions: (w, h) => _window?.UpdateStreamDimensions(w, h),
-                onHudUpdate:  text   => _window?.UpdateHud(text));
+                onFrame:      framePtr => _presenter!.PresentFrame(framePtr),
+                onDimensions: (w, h)   => _window?.UpdateStreamDimensions(w, h),
+                onHudUpdate:  text     => _window?.UpdateHud(text));
 
             _decoder.Initialize(FFmpeg.AutoGen.AVCodecID.AV_CODEC_ID_H264);
             _decoder.Start();

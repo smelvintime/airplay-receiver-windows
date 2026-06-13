@@ -44,7 +44,7 @@
     <PackageReference Include="SharpDX.D3DCompiler" Version="4.2.0" />
 
     <!-- Cryptography: SRP-6a, Ed25519, Curve25519 -->
-    <PackageReference Include="BouncyCastle.Cryptography" Version="2.3.0" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
   </ItemGroup>
 
   <!-- Native FFmpeg DLLs — place in native\x64\ -->

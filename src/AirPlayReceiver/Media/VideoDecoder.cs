@@ -31,7 +31,10 @@ public sealed unsafe class VideoDecoder : IDisposable
 {
     // ── Dependencies ──────────────────────────────────────────────────────────
 
-    private readonly Action<AVFrame*>      _onFrame;       // called on decode thread
+    // The decoded frame is handed across as an IntPtr (a boxed AVFrame*), because
+    // C# forbids pointer types as generic arguments to Action<>. The presenter,
+    // an unsafe class, casts it back to AVFrame*.
+    private readonly Action<IntPtr>        _onFrame;       // called on decode thread
     private readonly Action<int, int>      _onDimensions;  // (width, height) first frame
     private readonly Action<string>        _onHudUpdate;
 
@@ -53,12 +56,12 @@ public sealed unsafe class VideoDecoder : IDisposable
     // ── Construction ──────────────────────────────────────────────────────────
 
     /// <param name="onFrame">
-    ///   Called on the decode thread with each decoded AVFrame.
-    ///   The frame pointer is valid until this callback returns.
-    ///   The VideoPresenter should copy the texture reference, not hold the pointer.
+    ///   Called on the decode thread with each decoded frame as an IntPtr that
+    ///   wraps an AVFrame*. The pointer is valid only until this callback returns,
+    ///   so the VideoPresenter must copy the texture reference, not hold the pointer.
     /// </param>
     public VideoDecoder(
-        Action<AVFrame*> onFrame,
+        Action<IntPtr>   onFrame,
         Action<int, int> onDimensions,
         Action<string>   onHudUpdate)
     {
@@ -218,8 +221,9 @@ public sealed unsafe class VideoDecoder : IDisposable
                                   $"fmt={_frame->format}  hw={(AVPixelFormat)_frame->format == AVPixelFormat.AV_PIX_FMT_D3D11}");
             }
 
-            // Invoke the render callback (VideoPresenter)
-            _onFrame(_frame);
+            // Invoke the render callback (VideoPresenter). The pointer is passed
+            // as an IntPtr because Action<> can't take a pointer type argument.
+            _onFrame((IntPtr)_frame);
 
             // Unref immediately so FFmpeg can recycle the HW texture
             ffmpeg.av_frame_unref(_frame);
