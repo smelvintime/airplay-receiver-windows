@@ -34,8 +34,11 @@
     <!-- mDNS / DNS-SD -->
     <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
 
-    <!-- FFmpeg bindings -->
-    <PackageReference Include="FFmpeg.AutoGen" Version="6.1.0" />
+    <!-- FFmpeg bindings. Version maps to the native FFmpeg major version:
+         7.1.x binds FFmpeg 7.x (avcodec-61, avutil-59, swscale-8, ...). The
+         native DLLs you drop into native\x64\ MUST be a matching FFmpeg 7.x
+         shared build, or the P/Invoke calls won't resolve. -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
 
     <!-- DirectX interop (swap chain, textures, runtime shader compile) -->
     <PackageReference Include="SharpDX" Version="4.2.0" />
