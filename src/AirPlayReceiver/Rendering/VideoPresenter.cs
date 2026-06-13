@@ -127,8 +127,10 @@ public sealed unsafe class VideoPresenter : IDisposable
     /// Called by VideoDecoder on the decode thread for each decoded frame.
     /// Presents the NV12 texture to the swap chain.
     /// </summary>
-    public void PresentFrame(AVFrame* frame)
+    public void PresentFrame(IntPtr framePtr)
     {
+        AVFrame* frame = (AVFrame*)framePtr;
+
         // The D3D11VA frame has:
         //   frame->data[0] = (uint8_t*)ID3D11Texture2D*
         //   frame->data[1] = (uint8_t*)(uintptr_t)arrayIndex
