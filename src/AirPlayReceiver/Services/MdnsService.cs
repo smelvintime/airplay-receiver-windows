@@ -201,7 +201,7 @@ public sealed class MdnsService : IAsyncDisposable
     /// Returns the MAC address of the first non-loopback, active Ethernet or
     /// Wi-Fi adapter. Used as the AirPlay device identifier.
     /// </summary>
-    private static string GetMacAddress()
+    public static string GetMacAddress()
     {
         foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
         {
@@ -224,7 +224,7 @@ public sealed class MdnsService : IAsyncDisposable
     }
 
     /// <summary>Converts "AA:BB:CC:DD:EE:FF" into a lowercase UUID-style string.</summary>
-    private static string GuidFromMac(string mac)
+    public static string GuidFromMac(string mac)
     {
         string hex = mac.Replace(":", "").ToLowerInvariant().PadRight(32, '0');
         return $"{hex[..8]}-{hex[8..12]}-{hex[12..16]}-{hex[16..20]}-{hex[20..32]}";

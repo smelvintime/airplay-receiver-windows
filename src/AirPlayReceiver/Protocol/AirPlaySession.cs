@@ -30,6 +30,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private readonly RtpReceiver?   _rtpReceiver;   // null if FFmpeg is unavailable
     private readonly PairingHandler _pairing;
+    private readonly DeviceInfo     _deviceInfo;
 
     // Callbacks into the UI layer
     public event Action?         StreamStarted;
@@ -50,10 +51,11 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     // ── Construction ──────────────────────────────────────────────────────────
 
-    public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing)
+    public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo)
     {
         _rtpReceiver = rtpReceiver;
         _pairing     = pairing;
+        _deviceInfo  = deviceInfo;
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -74,6 +76,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             byte[] response = msg.Method switch
             {
                 "OPTIONS"       => HandleOptions(msg),
+                "GET"           => HandleGet(msg),
                 "GET_PARAMETER" => HandleGetParameter(msg),
                 "POST"          => HandlePost(msg),
                 "SETUP"         => HandleSetup(msg),
@@ -127,6 +130,80 @@ public sealed class AirPlaySession : IAsyncDisposable
             "/setProperty"       => HandleSetProperty(msg),
             _ => RtspMessage.BuildResponse(404, "Not Found", msg.CSeq),
         };
+    }
+
+    private byte[] HandleGet(RtspMessage msg) => msg.Uri switch
+    {
+        "/info" => HandleInfo(msg),
+        _       => BuildOk(msg.CSeq),
+    };
+
+    /// <summary>
+    /// Returns the receiver's capability plist. iOS calls GET /info after SETUP to
+    /// learn the display geometry it should encode the mirror stream at; an empty
+    /// reply makes it abort. Structure follows UxPlay lib/raop_handlers.h.
+    /// </summary>
+    private byte[] HandleInfo(RtspMessage msg)
+    {
+        // The first /info (a "qualifier" request) carries a plist body; iOS already
+        // has our TXT records from mDNS, so an empty 200 is accepted there. The
+        // post-SETUP /info has no body and needs the full capability plist below.
+        if (msg.Body is { Length: > 0 })
+            return RtspMessage.BuildResponse(200, "OK", msg.CSeq);
+
+        var displays = new List<object?>
+        {
+            new Dictionary<string, object?>
+            {
+                ["uuid"]           = "e0ff8a27-6738-3d56-8a16-cc53aacee925",
+                ["widthPhysical"]  = (long)0,
+                ["heightPhysical"] = (long)0,
+                ["width"]          = (long)_deviceInfo.DisplayWidth,
+                ["height"]         = (long)_deviceInfo.DisplayHeight,
+                ["widthPixels"]    = (long)_deviceInfo.DisplayWidth,
+                ["heightPixels"]   = (long)_deviceInfo.DisplayHeight,
+                ["rotation"]       = false,
+                ["refreshRate"]    = 1.0 / _deviceInfo.MaxFps,
+                ["maxFPS"]         = (long)_deviceInfo.MaxFps,
+                ["overscanned"]    = false,
+                ["features"]       = (long)14,
+            },
+        };
+
+        var audioFormat = new Dictionary<string, object?>
+        {
+            ["type"]               = (long)100,
+            ["audioInputFormats"]  = (long)0x3fffffc,
+            ["audioOutputFormats"] = (long)0x3fffffc,
+        };
+
+        var info = new Dictionary<string, object?>
+        {
+            ["deviceID"]                 = _deviceInfo.DeviceId,
+            ["macAddress"]               = _deviceInfo.DeviceId,
+            ["pk"]                       = _deviceInfo.PublicKey,
+            ["features"]                 = _deviceInfo.Features,
+            ["name"]                     = _deviceInfo.Name,
+            ["pi"]                       = _deviceInfo.Pi,
+            ["vv"]                       = (long)2,
+            ["statusFlags"]              = (long)68,
+            ["keepAliveLowPower"]        = (long)1,
+            ["keepAliveSendStatsAsBody"] = true,
+            ["sourceVersion"]            = _deviceInfo.SourceVersion,
+            ["model"]                    = _deviceInfo.Model,
+            ["initialVolume"]            = 0.0,
+            ["audioFormats"]             = new List<object?> { audioFormat },
+            ["displays"]                 = displays,
+        };
+
+        byte[] body = BinaryPlist.Write(info);
+        System.Diagnostics.Debug.WriteLine($"[Info] returning device info plist ({body.Length}B)");
+
+        var headers = new Dictionary<string, string>
+        {
+            ["Content-Type"] = "application/x-apple-binary-plist",
+        };
+        return RtspMessage.BuildResponse(200, "OK", msg.CSeq, headers, body);
     }
 
     private byte[] HandleSetup(RtspMessage msg)

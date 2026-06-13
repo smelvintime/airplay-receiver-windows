@@ -23,6 +23,10 @@ public sealed class AirPlayService : IAsyncDisposable
     private VideoDecoder?   _decoder;
     private RtpReceiver?    _rtpReceiver;
     private DeviceIdentity? _identity;
+    private DeviceInfo?     _deviceInfo;
+
+    // 64-bit form of the mDNS "features" value 0x5A7FFFF7,0x1E  → (0x1E << 32) | 0x5A7FFFF7.
+    private const long AirPlayFeatures64 = 0x1E5A7FFFF7L;
 
     // Callbacks into MainWindow (set via constructor — null-safe)
     private readonly MainWindow? _window;
@@ -43,6 +47,16 @@ public sealed class AirPlayService : IAsyncDisposable
 
         // ── 0. Device identity (shared by mDNS pk and the pairing handshake) ──
         _identity = DeviceIdentity.LoadOrCreate();
+
+        string deviceId = MdnsService.GetMacAddress();
+        _deviceInfo = new DeviceInfo
+        {
+            DeviceId  = deviceId,
+            Name      = deviceName,
+            PublicKey = _identity.PublicKeyBytes,
+            Features  = AirPlayFeatures64,
+            Pi        = MdnsService.GuidFromMac(deviceId),
+        };
 
         // ── 1. Video presenter ────────────────────────────────────────────────
         _presenter = new VideoPresenter();
@@ -104,7 +118,7 @@ public sealed class AirPlayService : IAsyncDisposable
     private AirPlaySession CreateSession()
     {
         var pairing = new PairingHandler(_identity!);
-        var session = new AirPlaySession(_rtpReceiver, pairing);
+        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!);
 
         session.StreamStarted += () => _window?.OnSessionStarted();
         session.StreamStopped += () => _window?.OnSessionEnded();
