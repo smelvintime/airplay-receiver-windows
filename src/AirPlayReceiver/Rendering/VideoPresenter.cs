@@ -49,10 +49,11 @@ public sealed unsafe class VideoPresenter : IDisposable
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    private int _swapChainWidth;
-    private int _swapChainHeight;
-    private int _frameWidth;
-    private int _frameHeight;
+    private int  _swapChainWidth;
+    private int  _swapChainHeight;
+    private int  _frameWidth;
+    private int  _frameHeight;
+    private bool _active = true;   // when false, drop frames and keep the surface black
 
     // ── Initialisation ────────────────────────────────────────────────────────
 
@@ -155,6 +156,8 @@ public sealed unsafe class VideoPresenter : IDisposable
 
         lock (_renderLock)
         {
+            if (!_active) return; // session ended — ignore late/queued frames
+
             EnsureNv12Textures(w, h);
 
             // Upload the planes (source row pitch = FFmpeg linesize, which may be padded).
@@ -175,6 +178,25 @@ public sealed unsafe class VideoPresenter : IDisposable
             _context.Draw(3, 0);
 
             _swapChain.Present(1, PresentFlags.None);
+        }
+    }
+
+    /// <summary>
+    /// Enables or disables presentation. When disabled (e.g. a mirroring session
+    /// ended) the surface is cleared to black and subsequent frames are dropped,
+    /// so the last frame doesn't linger under the idle overlay.
+    /// </summary>
+    public void SetActive(bool active)
+    {
+        lock (_renderLock)
+        {
+            _active = active;
+            if (!active)
+            {
+                _context.OutputMerger.SetRenderTargets(_rtv);
+                _context.ClearRenderTargetView(_rtv, new RawColor4(0, 0, 0, 1));
+                _swapChain.Present(1, PresentFlags.None);
+            }
         }
     }
 
