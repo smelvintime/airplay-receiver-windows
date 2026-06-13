@@ -1,5 +1,8 @@
 using Makaretu.Dns;
 using Makaretu.Dns.Resolving;
+using Org.BouncyCastle.Crypto.Generators;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Security;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -33,7 +36,11 @@ public sealed class MdnsService : IAsyncDisposable
     // Bit layout documented at:
     //   https://openairplay.github.io/airplay-spec/features.html
     //
-    private const string AirPlayFeatures  = "0x527FFFF7,0x00000001";
+    // UxPlay's known-good value for appearing in the iOS Screen Mirroring picker.
+    // The high word (0x1E) advertises the unified pair-setup / MFi capability bits
+    // that modern iOS requires before it will show a device as a mirroring target;
+    // the earlier high word of 0x1 caused iOS to resolve us but hide us from the list.
+    private const string AirPlayFeatures  = "0x5A7FFFF7,0x1E";
     private const string AirPlayModel     = "AppleTV6,2";   // Spoofed as Apple TV 4K
     private const string AirPlayOsVersion = "14.0";         // tvOS version string
 
@@ -43,6 +50,7 @@ public sealed class MdnsService : IAsyncDisposable
     private readonly string     _deviceName;
     private readonly string     _deviceId;   // MAC-style: "AA:BB:CC:DD:EE:FF"
     private readonly int        _port;
+    private readonly string     _publicKeyHex; // Ed25519 public key (32 bytes, hex)
     private readonly MulticastService _mdns;
     private readonly ServiceDiscovery _sd;
     private CancellationTokenSource?  _cts;
@@ -53,9 +61,10 @@ public sealed class MdnsService : IAsyncDisposable
     /// <param name="port">TCP port the RTSP server listens on (default 7000).</param>
     public MdnsService(string deviceName, int port = 7000)
     {
-        _deviceName = deviceName;
-        _port       = port;
-        _deviceId   = GetMacAddress();
+        _deviceName   = deviceName;
+        _port         = port;
+        _deviceId     = GetMacAddress();
+        _publicKeyHex = GenerateEd25519PublicKeyHex();
 
         _mdns = new MulticastService();
         _sd   = new ServiceDiscovery(_mdns);
@@ -144,7 +153,7 @@ public sealed class MdnsService : IAsyncDisposable
         AddTxt(airplayProfile, "flags",     AirPlayStatusFlags);
         AddTxt(airplayProfile, "model",     AirPlayModel);
         AddTxt(airplayProfile, "pi",        GuidFromMac(_deviceId));
-        AddTxt(airplayProfile, "pk",        PlaceholderPublicKey());
+        AddTxt(airplayProfile, "pk",        _publicKeyHex);
         AddTxt(airplayProfile, "srcvers",   "220.68");
         AddTxt(airplayProfile, "osvers",    AirPlayOsVersion);
         AddTxt(airplayProfile, "vv",        "2");  // vendor version
@@ -177,7 +186,7 @@ public sealed class MdnsService : IAsyncDisposable
         AddTxt(raopProfile, "vn",   "65537");
         AddTxt(raopProfile, "tp",   "UDP");
         AddTxt(raopProfile, "am",   AirPlayModel);
-        AddTxt(raopProfile, "pk",   PlaceholderPublicKey());
+        AddTxt(raopProfile, "pk",   _publicKeyHex);
 
         _sd.Advertise(raopProfile);
     }
@@ -224,11 +233,20 @@ public sealed class MdnsService : IAsyncDisposable
     }
 
     /// <summary>
-    /// 32-byte all-zero public key (hex).  Replace with a real Ed25519 key
-    /// generated during first run and persisted to app settings.  iOS 14+
-    /// validates this during pair-verify; a zeros key is accepted by iOS
-    /// when pairing PIN is disabled (screen-mirroring-only mode).
+    /// Generates a random Ed25519 public key and returns it as a 64-char hex
+    /// string for the <c>pk</c> TXT record. iOS reads this during discovery and
+    /// pair-verify; an all-zero placeholder can cause iOS to ignore the device.
+    ///
+    /// NOTE: this is currently generated fresh per run. When real pairing lands,
+    /// this keypair must be the same identity PairingHandler signs with, and
+    /// should be persisted so the device keeps a stable identity across restarts.
     /// </summary>
-    private static string PlaceholderPublicKey()
-        => new string('0', 64);
+    private static string GenerateEd25519PublicKeyHex()
+    {
+        var generator = new Ed25519KeyPairGenerator();
+        generator.Init(new Ed25519KeyGenerationParameters(new SecureRandom()));
+        var keyPair = generator.GenerateKeyPair();
+        var publicKey = (Ed25519PublicKeyParameters)keyPair.Public;
+        return Convert.ToHexString(publicKey.GetEncoded()).ToLowerInvariant();
+    }
 }
