@@ -48,6 +48,9 @@
 
     <!-- Cryptography: SRP-6a, Ed25519, Curve25519 -->
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+
+    <!-- Per-user registry access for the "launch at sign-in" setting -->
+    <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
   </ItemGroup>
 
   <!-- Native FFmpeg DLLs — place in native\x64\ -->
