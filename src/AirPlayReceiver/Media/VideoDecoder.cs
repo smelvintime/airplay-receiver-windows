@@ -27,7 +27,9 @@ namespace AirPlayReceiver.Media;
 ///   FFmpeg hw_decode example: doc/examples/hw_decode.c
 ///   UxPlay renderers/video_renderer_ffmpeg.c
 /// </summary>
-public sealed unsafe class VideoDecoder : IDisposable
+// Note: 'unsafe' is applied per-member rather than to the whole class, because
+// an async method (StopAsync) can't 'await' inside an unsafe context.
+public sealed class VideoDecoder : IDisposable
 {
     // ── Dependencies ──────────────────────────────────────────────────────────
 
@@ -40,11 +42,15 @@ public sealed unsafe class VideoDecoder : IDisposable
 
     // ── FFmpeg context ────────────────────────────────────────────────────────
 
-    private AVCodecContext* _codecCtx;
-    private AVBufferRef*    _hwDeviceCtx;
-    private AVPacket*       _packet;
-    private AVFrame*        _frame;
-    private AVFrame*        _swFrame;   // fallback software frame
+    private unsafe AVCodecContext* _codecCtx;
+    private unsafe AVBufferRef*    _hwDeviceCtx;
+    private unsafe AVPacket*       _packet;
+    private unsafe AVFrame*        _frame;
+    private unsafe AVFrame*        _swFrame;   // fallback software frame
+
+    // Kept alive for the codec context's lifetime so the GC doesn't collect the
+    // managed delegate that FFmpeg invokes to negotiate the hardware pixel format.
+    private unsafe AVCodecContext_get_format _getFormatCallback;
 
     // ── Threading ─────────────────────────────────────────────────────────────
 
@@ -73,16 +79,16 @@ public sealed unsafe class VideoDecoder : IDisposable
     // ── Initialisation ────────────────────────────────────────────────────────
 
     /// <param name="codecId">AV_CODEC_ID_H264 or AV_CODEC_ID_HEVC</param>
-    public void Initialize(AVCodecID codecId = AVCodecID.AV_CODEC_ID_H264)
+    public unsafe void Initialize(AVCodecID codecId = AVCodecID.AV_CODEC_ID_H264)
     {
         // ── Hardware device context ───────────────────────────────────────────
         AVBufferRef* hwCtx = null;
         int ret = ffmpeg.av_hwdevice_ctx_create(
             &hwCtx,
             AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA,
-            deviceName: null,
-            opts: null,
-            flags: 0);
+            null,   // device (default adapter)
+            null,   // options
+            0);     // flags
 
         if (ret < 0)
         {
@@ -109,7 +115,11 @@ public sealed unsafe class VideoDecoder : IDisposable
         if (_hwDeviceCtx != null)
         {
             _codecCtx->hw_device_ctx = ffmpeg.av_buffer_ref(_hwDeviceCtx);
-            _codecCtx->get_format    = GetHwFormat; // function pointer
+            // A method group can't convert directly to FFmpeg.AutoGen's get_format
+            // function-pointer struct; go through a delegate-typed field (which also
+            // keeps the callback alive against GC).
+            _getFormatCallback    = GetHwFormat;
+            _codecCtx->get_format = _getFormatCallback;
         }
 
         // Low-latency flags: don't wait for B-frames, decode immediately.
@@ -186,7 +196,7 @@ public sealed unsafe class VideoDecoder : IDisposable
         Console.WriteLine("[Decoder] Decode thread stopped.");
     }
 
-    private void DecodePacket(byte[] data)
+    private unsafe void DecodePacket(byte[] data)
     {
         fixed (byte* pData = data)
         {
@@ -237,7 +247,7 @@ public sealed unsafe class VideoDecoder : IDisposable
     /// queries which output format to use.
     /// This is called once during decoder initialisation / first keyframe.
     /// </summary>
-    private static AVPixelFormat GetHwFormat(AVCodecContext* ctx, AVPixelFormat* fmts)
+    private static unsafe AVPixelFormat GetHwFormat(AVCodecContext* ctx, AVPixelFormat* fmts)
     {
         for (AVPixelFormat* p = fmts; *p != AVPixelFormat.AV_PIX_FMT_NONE; p++)
         {
@@ -252,7 +262,7 @@ public sealed unsafe class VideoDecoder : IDisposable
 
     // ── Disposal ─────────────────────────────────────────────────────────────
 
-    public void Dispose()
+    public unsafe void Dispose()
     {
         if (_codecCtx != null)
         {

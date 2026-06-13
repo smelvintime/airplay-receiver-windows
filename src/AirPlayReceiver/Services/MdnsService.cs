@@ -107,7 +107,7 @@ public sealed class MdnsService : IAsyncDisposable
 
         var airplayProfile = new ServiceProfile(
             instanceName: _deviceName,
-            serviceType:  "_airplay._tcp",
+            serviceName:  "_airplay._tcp",
             port:         (ushort)_port
         );
 
@@ -134,7 +134,7 @@ public sealed class MdnsService : IAsyncDisposable
 
         var raopProfile = new ServiceProfile(
             instanceName: raopInstance,
-            serviceType:  "_raop._tcp",
+            serviceName:  "_raop._tcp",
             port:         (ushort)_port
         );
 
