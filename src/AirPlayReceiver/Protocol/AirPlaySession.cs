@@ -28,10 +28,11 @@ public sealed class AirPlaySession : IAsyncDisposable
 {
     // ── Dependencies injected at construction ─────────────────────────────────
 
-    private readonly RtpReceiver?   _rtpReceiver;   // null if FFmpeg is unavailable
-    private readonly PairingHandler _pairing;
-    private readonly DeviceInfo     _deviceInfo;
-    private readonly VideoDecoder?  _decoder;       // mirror video sink (null if FFmpeg absent)
+    private readonly RtpReceiver?      _rtpReceiver;   // null if FFmpeg is unavailable
+    private readonly PairingHandler    _pairing;
+    private readonly DeviceInfo        _deviceInfo;
+    private readonly VideoDecoder?     _decoder;       // mirror video sink (null if FFmpeg absent)
+    private readonly AirPlayVideoPlayer _videoPlayer;  // shared AirPlay Video (URL playback) state
 
     // Callbacks into the UI layer
     public event Action?         StreamStarted;
@@ -53,12 +54,14 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     // ── Construction ──────────────────────────────────────────────────────────
 
-    public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo, VideoDecoder? decoder)
+    public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo,
+                          VideoDecoder? decoder, AirPlayVideoPlayer videoPlayer)
     {
         _rtpReceiver = rtpReceiver;
         _pairing     = pairing;
         _deviceInfo  = deviceInfo;
         _decoder     = decoder;
+        _videoPlayer = videoPlayer;
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -82,6 +85,7 @@ public sealed class AirPlaySession : IAsyncDisposable
                 "GET"           => HandleGet(msg),
                 "GET_PARAMETER" => HandleGetParameter(msg),
                 "POST"          => HandlePost(msg),
+                "PUT"           => HandlePut(msg),
                 "SETUP"         => HandleSetup(msg),
                 "RECORD"        => HandleRecord(msg),
                 "SET_PARAMETER" => HandleSetParameter(msg),
@@ -122,24 +126,170 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandlePost(RtspMessage msg)
     {
-        // AirPlay uses HTTP-style POST for the pairing sub-protocol.
-        return msg.Uri switch
+        // AirPlay uses HTTP-style POST for the pairing sub-protocol and for the
+        // AirPlay Video (URL playback) control verbs. Match on the path so query
+        // strings (e.g. /rate?value=1.0) route correctly.
+        return msg.Path switch
         {
-            "/pair-setup"        => _pairing.HandlePairSetup(msg),
-            "/pair-verify"       => _pairing.HandlePairVerify(msg),
-            "/pair-add"          => _pairing.HandlePairAdd(msg),
-            "/fp-setup"          => _pairing.HandleFairPlaySetup(msg),
-            "/getProperty"       => HandleGetProperty(msg),
-            "/setProperty"       => HandleSetProperty(msg),
-            _ => RtspMessage.BuildResponse(404, "Not Found", msg.CSeq),
+            "/pair-setup"  => _pairing.HandlePairSetup(msg),
+            "/pair-verify" => _pairing.HandlePairVerify(msg),
+            "/pair-add"    => _pairing.HandlePairAdd(msg),
+            "/fp-setup"    => _pairing.HandleFairPlaySetup(msg),
+            "/getProperty" => HandleGetProperty(msg),
+            "/setProperty" => HandleSetProperty(msg),
+            // ── AirPlay Video control ─────────────────────────────────────────
+            "/play"        => HandlePlay(msg),
+            "/rate"        => HandleRate(msg),
+            "/scrub"       => HandleScrub(msg),
+            "/stop"        => HandleStop(msg),
+            "/reverse"     => HandleReverse(msg),
+            "/action"      => Ok(msg),
+            "/feedback"    => Ok(msg),
+            _ => RtspMessage.BuildResponse(404, "Not Found", msg.CSeq, protocol: msg.Version),
         };
     }
 
-    private byte[] HandleGet(RtspMessage msg) => msg.Uri switch
+    private byte[] HandlePut(RtspMessage msg) => msg.Path switch
     {
-        "/info" => HandleInfo(msg),
-        _       => BuildOk(msg.CSeq),
+        "/setProperty" => HandleSetProperty(msg),
+        _              => Ok(msg),
     };
+
+    private byte[] HandleGet(RtspMessage msg) => msg.Path switch
+    {
+        "/info"          => HandleInfo(msg),
+        "/playback-info" => HandlePlaybackInfo(msg),
+        "/server-info"   => HandleServerInfo(msg),
+        "/scrub"         => HandleScrub(msg),
+        _                => Ok(msg),
+    };
+
+    // ── AirPlay Video (URL playback) handlers ─────────────────────────────────
+
+    private byte[] HandlePlay(RtspMessage msg)
+    {
+        // The /play body carries the video URL. It may be a binary plist
+        // ("Content-Location" + "Start-Position") or a small text body
+        // ("Content-Location: <url>\nStart-Position: <pos>"). Parse both and log
+        // everything so we can see exactly what iOS sends.
+        byte[] body = msg.Body ?? Array.Empty<byte>();
+        string? url = null;
+        double  start = 0;
+
+        try
+        {
+            if (body.Length >= 8 && Encoding.ASCII.GetString(body, 0, 8) == "bplist00" &&
+                BinaryPlist.Parse(body) is Dictionary<string, object?> dict)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Video] /play plist keys: {string.Join(", ", dict.Keys)}");
+                url = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
+                if (dict.TryGetValue("Start-Position", out var sp))
+                    start = sp switch { double d => d, long l => (double)l, _ => 0.0 };
+            }
+            else
+            {
+                string text = Encoding.UTF8.GetString(body);
+                System.Diagnostics.Debug.WriteLine($"[Video] /play text body:\n{text}");
+                foreach (string line in text.Split('\n'))
+                {
+                    string l = line.Trim();
+                    if (l.StartsWith("Content-Location:", StringComparison.OrdinalIgnoreCase))
+                        url = l["Content-Location:".Length..].Trim();
+                    else if (l.StartsWith("Start-Position:", StringComparison.OrdinalIgnoreCase))
+                        double.TryParse(l["Start-Position:".Length..].Trim(), out start);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[Video] /play parse failed: {ex.Message}");
+        }
+
+        if (!string.IsNullOrEmpty(url))
+            _videoPlayer.Play(url!, start);
+        else
+            System.Diagnostics.Debug.WriteLine($"[Video] /play had no Content-Location (body={body.Length}B)");
+
+        return Ok(msg);
+    }
+
+    private byte[] HandleRate(RtspMessage msg)
+    {
+        if (double.TryParse(msg.QueryValue("value"), System.Globalization.CultureInfo.InvariantCulture, out double rate))
+            _videoPlayer.SetRate(rate);
+        return Ok(msg);
+    }
+
+    private byte[] HandleScrub(RtspMessage msg)
+    {
+        // POST/PUT sets the position; GET reports it.
+        if (msg.Method == "GET")
+        {
+            string text = $"duration: {_videoPlayer.Duration}\r\nposition: {_videoPlayer.Position}\r\n";
+            return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
+                new Dictionary<string, string> { ["Content-Type"] = "text/parameters" },
+                Encoding.UTF8.GetBytes(text), protocol: msg.Version);
+        }
+
+        if (double.TryParse(msg.QueryValue("position"), System.Globalization.CultureInfo.InvariantCulture, out double pos))
+            _videoPlayer.Scrub(pos);
+        return Ok(msg);
+    }
+
+    private byte[] HandleStop(RtspMessage msg)
+    {
+        _videoPlayer.Stop();
+        return Ok(msg);
+    }
+
+    /// <summary>The reverse-HTTP event channel: ack with a protocol switch and keep the connection open.</summary>
+    private byte[] HandleReverse(RtspMessage msg)
+    {
+        var headers = new Dictionary<string, string>
+        {
+            ["Upgrade"]    = "PTTH/1.0",
+            ["Connection"] = "Upgrade",
+        };
+        return RtspMessage.BuildResponse(101, "Switching Protocols", msg.CSeq, headers, protocol: msg.Version);
+    }
+
+    private byte[] HandlePlaybackInfo(RtspMessage msg)
+    {
+        var info = new Dictionary<string, object?>
+        {
+            ["duration"]                = _videoPlayer.Duration,
+            ["position"]                = _videoPlayer.Position,
+            ["rate"]                    = _videoPlayer.Rate,
+            ["readyToPlay"]             = _videoPlayer.ReadyToPlay,
+            ["playbackBufferEmpty"]     = !_videoPlayer.ReadyToPlay,
+            ["playbackBufferFull"]      = false,
+            ["playbackLikelyToKeepUp"]  = _videoPlayer.ReadyToPlay,
+            ["loadedTimeRanges"]        = new List<object?>(),
+            ["seekableTimeRanges"]      = new List<object?>(),
+        };
+        return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
+            new Dictionary<string, string> { ["Content-Type"] = "application/x-apple-binary-plist" },
+            BinaryPlist.Write(info), protocol: msg.Version);
+    }
+
+    private byte[] HandleServerInfo(RtspMessage msg)
+    {
+        var info = new Dictionary<string, object?>
+        {
+            ["deviceid"]  = _deviceInfo.DeviceId,
+            ["features"]  = _deviceInfo.Features,
+            ["model"]     = _deviceInfo.Model,
+            ["protovers"] = "1.0",
+            ["srcvers"]   = _deviceInfo.SourceVersion,
+        };
+        return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
+            new Dictionary<string, string> { ["Content-Type"] = "application/x-apple-binary-plist" },
+            BinaryPlist.Write(info), protocol: msg.Version);
+    }
+
+    /// <summary>200 OK echoing the request's protocol (RTSP/1.0 or HTTP/1.1).</summary>
+    private static byte[] Ok(RtspMessage msg)
+        => RtspMessage.BuildResponse(200, "OK", msg.CSeq, protocol: msg.Version);
 
     /// <summary>
     /// Returns the receiver's capability plist. iOS calls GET /info after SETUP to
