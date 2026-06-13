@@ -80,7 +80,7 @@ public sealed class RtpReceiver : IAsyncDisposable
         _cts      = new CancellationTokenSource();
         _udpData  = new UdpClient(VideoDataPort);
 
-        Console.WriteLine($"[RTP] Listening on UDP {VideoDataPort}");
+        System.Diagnostics.Debug.WriteLine($"[RTP] Listening on UDP {VideoDataPort}");
 
         _receiveLoop = ReceiveLoopAsync(_cts.Token);
         return Task.CompletedTask;
@@ -92,7 +92,7 @@ public sealed class RtpReceiver : IAsyncDisposable
         _udpData?.Close();
         if (_receiveLoop is not null)
             await _receiveLoop.ConfigureAwait(false);
-        Console.WriteLine("[RTP] Stopped.");
+        System.Diagnostics.Debug.WriteLine("[RTP] Stopped.");
     }
 
     public void Flush()
@@ -117,7 +117,7 @@ public sealed class RtpReceiver : IAsyncDisposable
             catch (OperationCanceledException) { break; }
             catch (SocketException ex)
             {
-                Console.WriteLine($"[RTP] Socket error: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[RTP] Socket error: {ex.Message}");
                 break;
             }
 
@@ -198,7 +198,7 @@ public sealed class RtpReceiver : IAsyncDisposable
                 break;
 
             default:
-                Console.WriteLine($"[RTP H.264] Unhandled NAL type {nalType}");
+                System.Diagnostics.Debug.WriteLine($"[RTP H.264] Unhandled NAL type {nalType}");
                 break;
         }
     }

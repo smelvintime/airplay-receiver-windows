@@ -67,12 +67,40 @@ public sealed class MdnsService : IAsyncDisposable
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
+        // Diagnostics: log which interfaces we bind to and any AirPlay/RAOP
+        // queries that arrive, so we can tell whether iOS is reaching us at all.
+        // (Seeing a query here means the network path works and the problem is in
+        //  our response; seeing none points to firewall/network/subnet isolation.)
+        _mdns.NetworkInterfaceDiscovered += (_, e) =>
+        {
+            foreach (var nic in e.NetworkInterfaces)
+                System.Diagnostics.Debug.WriteLine($"[mDNS] Listening on interface: {nic.Name}");
+        };
+
+        _mdns.QueryReceived += (_, e) =>
+        {
+            try
+            {
+                foreach (var q in e.Message.Questions)
+                {
+                    string name = q.Name.ToString();
+                    if (name.Contains("airplay", StringComparison.OrdinalIgnoreCase) ||
+                        name.Contains("raop",    StringComparison.OrdinalIgnoreCase))
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[mDNS] Query from {e.RemoteEndPoint}: {q.Type} {name}");
+                    }
+                }
+            }
+            catch { /* diagnostic logging only — never let it throw */ }
+        };
+
         RegisterAirPlayService();
         RegisterRaopService();
 
         _mdns.Start();
 
-        Console.WriteLine($"[mDNS] Advertising '{_deviceName}' on port {_port}  deviceid={_deviceId}");
+        System.Diagnostics.Debug.WriteLine($"[mDNS] Advertising '{_deviceName}' on port {_port}  deviceid={_deviceId}");
         return Task.CompletedTask;
     }
 
@@ -80,7 +108,7 @@ public sealed class MdnsService : IAsyncDisposable
     {
         _cts?.Cancel();
         _mdns.Stop();
-        Console.WriteLine("[mDNS] Stopped.");
+        System.Diagnostics.Debug.WriteLine("[mDNS] Stopped.");
         return Task.CompletedTask;
     }
 

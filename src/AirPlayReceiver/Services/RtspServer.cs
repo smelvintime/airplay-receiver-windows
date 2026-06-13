@@ -46,7 +46,7 @@ public sealed class RtspServer : IAsyncDisposable
         _listener = new TcpListener(IPAddress.Any, _port);
         _listener.Start(backlog: 4);
 
-        Console.WriteLine($"[RTSP] Listening on 0.0.0.0:{_port}");
+        System.Diagnostics.Debug.WriteLine($"[RTSP] Listening on 0.0.0.0:{_port}");
 
         _acceptLoop = AcceptLoopAsync(_cts.Token);
         return Task.CompletedTask;
@@ -58,7 +58,7 @@ public sealed class RtspServer : IAsyncDisposable
         _listener?.Stop();
         if (_acceptLoop is not null)
             await _acceptLoop.ConfigureAwait(false);
-        Console.WriteLine("[RTSP] Stopped.");
+        System.Diagnostics.Debug.WriteLine("[RTSP] Stopped.");
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
@@ -77,7 +77,7 @@ public sealed class RtspServer : IAsyncDisposable
             catch (OperationCanceledException) { break; }
             catch (SocketException ex)
             {
-                Console.WriteLine($"[RTSP] Accept error: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[RTSP] Accept error: {ex.Message}");
                 break;
             }
 
@@ -91,7 +91,7 @@ public sealed class RtspServer : IAsyncDisposable
     private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
         var remote = client.Client.RemoteEndPoint;
-        Console.WriteLine($"[RTSP] Connection from {remote}");
+        System.Diagnostics.Debug.WriteLine($"[RTSP] Connection from {remote}");
 
         var session = _sessionFactory();
         SessionStarted?.Invoke(session);
@@ -103,13 +103,13 @@ public sealed class RtspServer : IAsyncDisposable
         }
         catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException)
         {
-            Console.WriteLine($"[RTSP] Session ended ({remote}): {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[RTSP] Session ended ({remote}): {ex.Message}");
         }
         finally
         {
             client.Dispose();
             SessionEnded?.Invoke(session);
-            Console.WriteLine($"[RTSP] Closed {remote}");
+            System.Diagnostics.Debug.WriteLine($"[RTSP] Closed {remote}");
         }
     }
 }
