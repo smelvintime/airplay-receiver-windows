@@ -1,0 +1,36 @@
+# Build output
+bin/
+obj/
+out/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.userprefs
+
+# NuGet
+*.nupkg
+packages/
+.nuget/
+
+# Windows App SDK / WinUI packaging
+AppPackages/
+BundleArtifacts/
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+
+# Native FFmpeg DLLs (download separately — see ARCHITECTURE.md §5)
+src/AirPlayReceiver/native/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
