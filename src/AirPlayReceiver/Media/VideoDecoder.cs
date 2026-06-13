@@ -57,7 +57,8 @@ public sealed class VideoDecoder : IDisposable
     private readonly BlockingCollection<byte[]> _packetQueue = new(boundedCapacity: 120);
     private CancellationTokenSource? _cts;
     private Task? _decodeTask;
-    private bool _dimensionsReported;
+    private int _lastWidth;
+    private int _lastHeight;
 
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -222,10 +223,13 @@ public sealed class VideoDecoder : IDisposable
                 break;
             }
 
-            // Report stream dimensions on the first frame
-            if (!_dimensionsReported)
+            // Report stream dimensions whenever they change (e.g. the phone
+            // rotates between portrait and landscape) so the UI re-letterboxes
+            // to the new aspect ratio instead of stretching.
+            if (_frame->width != _lastWidth || _frame->height != _lastHeight)
             {
-                _dimensionsReported = true;
+                _lastWidth  = _frame->width;
+                _lastHeight = _frame->height;
                 _onDimensions(_frame->width, _frame->height);
                 System.Diagnostics.Debug.WriteLine($"[Decoder] Stream: {_frame->width}×{_frame->height}  " +
                                   $"fmt={_frame->format}  hw={(AVPixelFormat)_frame->format == AVPixelFormat.AV_PIX_FMT_D3D11}");
