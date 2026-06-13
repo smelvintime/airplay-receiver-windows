@@ -44,6 +44,9 @@ public sealed class PairingHandler
 
     private readonly DeviceIdentity _identity;
 
+    /// <summary>FairPlay (fp-setup) handshake state for this session.</summary>
+    public FairPlayHandshake FairPlay { get; } = new();
+
     // ── pair-verify per-session state (set in step 1, used in step 2) ─────────
     private byte[]? _verifyAesKey;
     private byte[]? _verifyAesIv;
@@ -158,8 +161,18 @@ public sealed class PairingHandler
 
     public byte[] HandleFairPlaySetup(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine("[Pairing] /fp-setup → 421 (FairPlay not implemented)");
-        return RtspMessage.BuildResponse(421, "Misdirected Request", msg.CSeq);
+        byte[] body = msg.Body ?? Array.Empty<byte>();
+        byte[]? response = FairPlay.Process(body);
+
+        if (response is null)
+        {
+            System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup unrecognised (body={body.Length}B)");
+            return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq);
+        }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"[Pairing] /fp-setup → {response.Length}-byte response (request {body.Length}B)");
+        return RtspMessage.BuildResponse(200, "OK", msg.CSeq, OctetStreamHeaders(), response);
     }
 
     // ── Crypto helpers ────────────────────────────────────────────────────────
