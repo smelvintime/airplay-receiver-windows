@@ -213,7 +213,7 @@ A C# proof-of-concept. Not production-ready, but shows the RTSP parser pattern i
 
 ```xml
 <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
-<PackageReference Include="FFmpeg.AutoGen" Version="6.1.0" />
+<PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
 <PackageReference Include="SharpDX" Version="4.2.0" />
 <PackageReference Include="SharpDX.Direct3D11" Version="4.2.0" />
 <PackageReference Include="SharpDX.DXGI" Version="4.2.0" />
@@ -224,8 +224,8 @@ A C# proof-of-concept. Not production-ready, but shows the RTSP parser pattern i
 
 ### Native FFmpeg DLLs
 
-Download the latest `ffmpeg-n6.x-win64-gpl-shared` build from https://github.com/BtbN/FFmpeg-Builds/releases.  
-Copy to `native/x64/`:
+Download an `ffmpeg-n7.1-...-win64-gpl-shared` build from https://github.com/BtbN/FFmpeg-Builds/releases (the major version must match `FFmpeg.AutoGen` — 7.x → `avcodec-61`; do **not** grab an 8.x build, whose `avcodec-62` DLLs won't bind).  
+Copy the DLLs from the build's `bin/` folder to `native/x64/`:
 
 ```
 avcodec-61.dll
