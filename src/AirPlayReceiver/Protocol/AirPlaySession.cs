@@ -31,6 +31,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     private readonly RtpReceiver?   _rtpReceiver;   // null if FFmpeg is unavailable
     private readonly PairingHandler _pairing;
     private readonly DeviceInfo     _deviceInfo;
+    private readonly VideoDecoder?  _decoder;       // mirror video sink (null if FFmpeg absent)
 
     // Callbacks into the UI layer
     public event Action?         StreamStarted;
@@ -47,15 +48,17 @@ public sealed class AirPlaySession : IAsyncDisposable
     private UdpClient?            _timing;        // timing/NTP channel (minimal)
     private byte[]?               _streamEkey;    // FairPlay-encrypted stream key (from SETUP)
     private byte[]?               _streamEiv;     // stream AES IV (from SETUP)
+    private byte[]?               _streamAesKey;  // FairPlay-decrypted 16-byte AES key
     private long                  _streamConnectionId;
 
     // ── Construction ──────────────────────────────────────────────────────────
 
-    public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo)
+    public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo, VideoDecoder? decoder)
     {
         _rtpReceiver = rtpReceiver;
         _pairing     = pairing;
         _deviceInfo  = deviceInfo;
+        _decoder     = decoder;
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -237,6 +240,20 @@ public sealed class AirPlaySession : IAsyncDisposable
             _streamEiv  = eiv;
             System.Diagnostics.Debug.WriteLine($"[Setup] phase 1: ekey={ekey.Length}B eiv={eiv.Length}B");
 
+            // FairPlay-decrypt the stream key (needs the fp-setup phase-2 key message).
+            if (_pairing.FairPlay.KeyMessage is { } keyMessage && ekey.Length == 72)
+            {
+                try
+                {
+                    _streamAesKey = Playfair.DecryptKey(keyMessage, ekey);
+                    System.Diagnostics.Debug.WriteLine("[Setup] FairPlay stream key unwrapped (16B)");
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[Setup] FairPlay key unwrap failed: {ex.Message}");
+                }
+            }
+
             int eventPort  = OpenEventChannel();
             int timingPort = OpenTimingChannel();
             response["eventPort"]  = (long)eventPort;
@@ -259,6 +276,26 @@ public sealed class AirPlaySession : IAsyncDisposable
                         stream.TryGetValue("streamConnectionID", out var c) && c is long cl ? cl : 0;
 
                     _mirror = new MirrorStreamReceiver();
+
+                    // Derive the per-stream AES key/IV and wire decryption + decode.
+                    if (_streamAesKey is { } aeskey && _pairing.EcdhSecret is { } ecdh)
+                    {
+                        try
+                        {
+                            var crypto = new MirrorStreamCrypto(aeskey, ecdh, unchecked((ulong)_streamConnectionId));
+                            _mirror.Configure(crypto, _decoder);
+                            System.Diagnostics.Debug.WriteLine("[Setup] mirror stream crypto configured");
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"[Setup] mirror crypto setup failed: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        System.Diagnostics.Debug.WriteLine("[Setup] mirror running without decryption (missing key/ecdh)");
+                    }
+
                     _mirror.Start();
 
                     responseStreams.Add(new Dictionary<string, object?>

@@ -64,4 +64,13 @@
     </Content>
   </ItemGroup>
 
+  <!-- Prebuilt FairPlay key-unwrap DLL (P/Invoked by Protocol/Playfair.cs).
+       Copied next to the exe so the default DLL search resolves it. -->
+  <ItemGroup>
+    <Content Include="vendor\playfair\playfair.dll">
+      <Link>playfair.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
 </Project>
