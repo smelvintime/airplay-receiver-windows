@@ -26,8 +26,17 @@ public partial class App : Application
 
         // Boot the AirPlay service stack (mDNS + RTSP server).
         // Pass the window so the decoder/session can drive the HUD and overlays.
+        // Guard startup so a failure (e.g. missing FFmpeg DLLs) leaves the window
+        // open and usable instead of crashing the process on launch.
         _airPlayService = new AirPlayService(_window.VideoPresenter, _window);
-        await _airPlayService.StartAsync();
+        try
+        {
+            await _airPlayService.StartAsync();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[App] AirPlay service failed to start: {ex}");
+        }
 
         _window.Closed += async (_, _) =>
         {

@@ -15,6 +15,10 @@
          ports (7000/7011) without the loopback/network restrictions that apply
          inside an MSIX AppContainer. -->
     <WindowsPackageType>None</WindowsPackageType>
+    <!-- Bundle the Windows App SDK runtime so F5 works on a clean machine
+         without separately installing the Windows App Runtime redistributable. -->
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

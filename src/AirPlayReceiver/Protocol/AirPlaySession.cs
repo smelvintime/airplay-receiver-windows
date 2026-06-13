@@ -26,7 +26,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 {
     // ── Dependencies injected at construction ─────────────────────────────────
 
-    private readonly RtpReceiver    _rtpReceiver;
+    private readonly RtpReceiver?   _rtpReceiver;   // null if FFmpeg is unavailable
     private readonly PairingHandler _pairing;
 
     // Callbacks into the UI layer
@@ -42,7 +42,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     // ── Construction ──────────────────────────────────────────────────────────
 
-    public AirPlaySession(RtpReceiver rtpReceiver, PairingHandler pairing)
+    public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing)
     {
         _rtpReceiver = rtpReceiver;
         _pairing     = pairing;
@@ -139,9 +139,9 @@ public sealed class AirPlaySession : IAsyncDisposable
             ParseTransportHeader(transport);
         }
 
-        // Choose our server-side ports.
-        int serverDataPort    = _rtpReceiver.VideoDataPort;
-        int serverControlPort = _rtpReceiver.VideoControlPort;
+        // Choose our server-side ports (defaults when the RTP receiver is absent).
+        int serverDataPort    = _rtpReceiver?.VideoDataPort    ?? 7011;
+        int serverControlPort = _rtpReceiver?.VideoControlPort ?? 7012;
 
         var headers = new Dictionary<string, string>
         {
@@ -159,11 +159,13 @@ public sealed class AirPlaySession : IAsyncDisposable
         // iOS sends RECORD to begin the RTP stream.
         // If pairing produced AES-CBC keys, hand them to the RTP receiver before
         // the stream starts; otherwise it runs in cleartext passthrough mode.
-        if (_pairing.AesKey is { } key && _pairing.AesIv is { } iv)
+        if (_rtpReceiver is not null &&
+            _pairing.AesKey is { } key && _pairing.AesIv is { } iv)
             _rtpReceiver.SetDecryptionKeys(key, iv);
 
         _isRecording = true;
-        _ = _rtpReceiver.StartAsync();
+        if (_rtpReceiver is not null)
+            _ = _rtpReceiver.StartAsync();
         StreamStarted?.Invoke();
 
         var headers = new Dictionary<string, string>
@@ -183,7 +185,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandleFlush(RtspMessage msg)
     {
-        _rtpReceiver.Flush();
+        _rtpReceiver?.Flush();
         return BuildOk(msg.CSeq);
     }
 
@@ -216,7 +218,8 @@ public sealed class AirPlaySession : IAsyncDisposable
         if (_isRecording)
         {
             _isRecording = false;
-            await _rtpReceiver.StopAsync();
+            if (_rtpReceiver is not null)
+                await _rtpReceiver.StopAsync();
             StreamStopped?.Invoke();
         }
     }

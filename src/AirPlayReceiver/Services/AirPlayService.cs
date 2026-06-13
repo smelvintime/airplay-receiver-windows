@@ -44,19 +44,31 @@ public sealed class AirPlayService : IAsyncDisposable
         _presenter = new VideoPresenter();
         _presenter.Initialize(_panel);
 
-        // ── 2. Video decoder ──────────────────────────────────────────────────
-        _decoder = new VideoDecoder(
-            onFrame:      frame  => _presenter.PresentFrame(frame),
-            onDimensions: (w, h) => _window?.UpdateStreamDimensions(w, h),
-            onHudUpdate:  text   => _window?.UpdateHud(text));
+        // ── 2. Video decoder + RTP receiver ───────────────────────────────────
+        // FFmpeg is optional on first launch: if the native DLLs aren't present
+        // (see ARCHITECTURE.md §5) the decoder init throws, but discovery and the
+        // RTSP server should still come up so the app runs and is discoverable.
+        try
+        {
+            _decoder = new VideoDecoder(
+                onFrame:      frame  => _presenter.PresentFrame(frame),
+                onDimensions: (w, h) => _window?.UpdateStreamDimensions(w, h),
+                onHudUpdate:  text   => _window?.UpdateHud(text));
 
-        _decoder.Initialize(FFmpeg.AutoGen.AVCodecID.AV_CODEC_ID_H264);
-        _decoder.Start();
+            _decoder.Initialize(FFmpeg.AutoGen.AVCodecID.AV_CODEC_ID_H264);
+            _decoder.Start();
 
-        // ── 3. RTP receiver ───────────────────────────────────────────────────
-        _rtpReceiver = new RtpReceiver(_decoder);
+            _rtpReceiver = new RtpReceiver(_decoder);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[AirPlay] Video decoder unavailable: {ex.Message}");
+            _window?.UpdateHud("Video decoding unavailable — FFmpeg DLLs missing (ARCHITECTURE.md §5)");
+            _decoder     = null;
+            _rtpReceiver = null;
+        }
 
-        // ── 4. RTSP server ────────────────────────────────────────────────────
+        // ── 3. RTSP server ────────────────────────────────────────────────────
         _rtsp = new RtspServer(port: 7000, sessionFactory: CreateSession);
         _rtsp.SessionStarted += OnSessionStarted;
         _rtsp.SessionEnded   += OnSessionEnded;
@@ -88,7 +100,7 @@ public sealed class AirPlayService : IAsyncDisposable
     private AirPlaySession CreateSession()
     {
         var pairing = new PairingHandler();
-        var session = new AirPlaySession(_rtpReceiver!, pairing);
+        var session = new AirPlaySession(_rtpReceiver, pairing);
 
         session.StreamStarted += () => _window?.OnSessionStarted();
         session.StreamStopped += () => _window?.OnSessionEnded();

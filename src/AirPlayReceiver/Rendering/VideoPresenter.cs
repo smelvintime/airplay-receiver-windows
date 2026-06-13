@@ -60,6 +60,12 @@ public sealed unsafe class VideoPresenter : IDisposable
         flags |= DeviceCreationFlags.Debug;
 #endif
 
+        // The panel hasn't been laid out yet at app launch, so ActualWidth/Height
+        // are 0. DXGI rejects a 0-sized swap chain, so clamp to at least 1px; the
+        // panel's SizeChanged handler resizes the buffers once layout completes.
+        int initialWidth  = Math.Max(1, (int)panel.ActualWidth);
+        int initialHeight = Math.Max(1, (int)panel.ActualHeight);
+
         SharpDX.Direct3D11.Device.CreateWithSwapChain(
             DriverType.Hardware,
             flags,
@@ -69,7 +75,7 @@ public sealed unsafe class VideoPresenter : IDisposable
                 SharpDX.Direct3D.FeatureLevel.Level_11_0,
                 SharpDX.Direct3D.FeatureLevel.Level_10_1,
             },
-            BuildSwapChainDesc((int)panel.ActualWidth, (int)panel.ActualHeight),
+            BuildSwapChainDesc(initialWidth, initialHeight),
             out SharpDX.Direct3D11.Device device,
             out SwapChain swapChain);
 
@@ -85,8 +91,8 @@ public sealed unsafe class VideoPresenter : IDisposable
         var panelNative = panel.As<ISwapChainPanelNative>();
         panelNative.SetSwapChain(_swapChain.NativePointer);
 
-        _swapChainWidth  = (int)panel.ActualWidth;
-        _swapChainHeight = (int)panel.ActualHeight;
+        _swapChainWidth  = initialWidth;
+        _swapChainHeight = initialHeight;
 
         // ── Render target view ────────────────────────────────────────────────
         CreateRenderTargetView();
