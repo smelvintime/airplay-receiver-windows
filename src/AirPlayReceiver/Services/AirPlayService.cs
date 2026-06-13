@@ -25,6 +25,9 @@ public sealed class AirPlayService : IAsyncDisposable
     private DeviceIdentity? _identity;
     private DeviceInfo?     _deviceInfo;
 
+    // Shared AirPlay Video (URL playback) state, referenced by every session.
+    private readonly AirPlayVideoPlayer _videoPlayer = new();
+
     // 64-bit form of the mDNS "features" value 0x5A7FFFF7,0x1E  → (0x1E << 32) | 0x5A7FFFF7.
     private const long AirPlayFeatures64 = 0x1E5A7FFFF7L;
 
@@ -118,7 +121,7 @@ public sealed class AirPlayService : IAsyncDisposable
     private AirPlaySession CreateSession()
     {
         var pairing = new PairingHandler(_identity!);
-        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder);
+        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer);
 
         session.StreamStarted += () => { _window?.OnSessionStarted(); _presenter?.SetActive(true); };
         session.StreamStopped += () => { _window?.OnSessionEnded();   _presenter?.SetActive(false); };

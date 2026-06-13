@@ -25,6 +25,24 @@ public sealed class RtspMessage
     // Convenience
     public int    CSeq        => Headers.TryGetValue("CSeq", out var v) ? int.Parse(v) : 0;
     public string ContentType => Headers.TryGetValue("Content-Type", out var v) ? v : string.Empty;
+
+    /// <summary>The request path without the query string (e.g. "/rate" for "/rate?value=1.0").</summary>
+    public string Path => Uri.Split('?', 2)[0];
+
+    /// <summary>Returns a query-string parameter value (e.g. <c>value</c> from "/rate?value=1.0"), or null.</summary>
+    public string? QueryValue(string name)
+    {
+        int q = Uri.IndexOf('?');
+        if (q < 0) return null;
+        foreach (string pair in Uri[(q + 1)..].Split('&'))
+        {
+            int eq = pair.IndexOf('=');
+            string key = eq < 0 ? pair : pair[..eq];
+            if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
+                return eq < 0 ? string.Empty : pair[(eq + 1)..];
+        }
+        return null;
+    }
     public int    ContentLength
     {
         get
@@ -117,16 +135,18 @@ public sealed class RtspMessage
 
     // ── Serialisation ─────────────────────────────────────────────────────────
 
-    /// <summary>Serialises an RTSP response with the given status code and reason.</summary>
+    /// <summary>Serialises a response with the given status code and reason.</summary>
+    /// <param name="protocol">Protocol/version for the status line (echo the request's — "RTSP/1.0" or "HTTP/1.1").</param>
     public static byte[] BuildResponse(
         int statusCode,
         string reasonPhrase,
         int cseq,
         Dictionary<string, string>? headers = null,
-        byte[]? body = null)
+        byte[]? body = null,
+        string protocol = "RTSP/1.0")
     {
         var sb = new StringBuilder();
-        sb.Append($"RTSP/1.0 {statusCode} {reasonPhrase}\r\n");
+        sb.Append($"{protocol} {statusCode} {reasonPhrase}\r\n");
         sb.Append($"CSeq: {cseq}\r\n");
 
         if (headers is not null)
