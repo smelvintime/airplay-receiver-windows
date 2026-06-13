@@ -232,6 +232,11 @@ public static class BinaryPlist
                 WriteIntObject(s, Convert.ToInt64(o));
                 break;
 
+            case double d:
+                s.WriteByte(0x23); // real, 8 bytes
+                WriteBE(s, BitConverter.DoubleToInt64Bits(d), 8);
+                break;
+
             case List<object?> list:
             {
                 var children = arrayChildren[list];
