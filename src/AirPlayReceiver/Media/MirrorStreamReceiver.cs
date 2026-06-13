@@ -7,35 +7,43 @@ using System.Threading.Tasks;
 namespace AirPlayReceiver.Media;
 
 /// <summary>
-/// Receives the AirPlay 2 screen-mirroring video stream over a TCP connection.
+/// Receives the AirPlay 2 screen-mirroring video stream over a TCP connection,
+/// decrypts the frames (continuous AES-128-CTR) and feeds Annex-B H.264 to the
+/// decoder.
 ///
-/// Unlike AirPlay 1 audio (UDP RTP), mirroring video arrives on a TCP "data"
-/// port negotiated in SETUP. Each frame is framed as:
-///   • a 128-byte header — payload length is a little-endian int32 at offset 0,
-///     payload type is a little-endian int16 at offset 4,
-///   • followed by <c>payloadLength</c> bytes of payload.
+/// Frame framing (RPiPlay lib/raop_rtp_mirror.c): a 128-byte header — payload
+/// length is a little-endian int32 at offset 0, payload type a little-endian
+/// int16 at offset 4 — followed by <c>payloadLength</c> bytes.
 ///
-/// Payload types (from RPiPlay lib/raop_rtp_mirror.c):
-///   0 = encrypted H.264 video frame (AVCC length-prefixed NAL units),
-///   1 = codec config (SPS/PPS),
-///   2 = heartbeat / other.
-///
-/// This first cut listens, accepts the connection, and logs each frame's type
-/// and size so we can confirm the stream is flowing. Decryption (AES from the
-/// FairPlay/ECDH key material) and feeding the decoder come next.
+/// Payload types we handle:
+///   0 = encrypted H.264 video (AVCC length-prefixed NALUs) → decrypt → Annex-B → decode
+///   1 = codec config (avcC: SPS/PPS), cleartext → Annex-B → decode
+/// Other types (2 heartbeat, 5, …) are ignored, matching RPiPlay; only type-0
+/// frames advance the CTR keystream.
 /// </summary>
 public sealed class MirrorStreamReceiver : IAsyncDisposable
 {
     private const int HeaderSize = 128;
+    private static readonly byte[] StartCode = { 0x00, 0x00, 0x00, 0x01 };
 
     private TcpListener?             _listener;
     private CancellationTokenSource? _cts;
     private Task?                    _acceptLoop;
 
+    private MirrorStreamCrypto? _crypto;   // null → no decryption (frames only logged)
+    private VideoDecoder?       _decoder;  // null → no decode
+    private bool                _firstFrameLogged;
+
     /// <summary>The TCP port the OS assigned; returned to iOS in the SETUP response.</summary>
     public int Port { get; private set; }
 
-    /// <summary>Starts listening on an ephemeral TCP port and begins accepting the mirror connection.</summary>
+    /// <summary>Supplies the per-stream decryption keys and the decoder to feed. Call before <see cref="Start"/>.</summary>
+    public void Configure(MirrorStreamCrypto? crypto, VideoDecoder? decoder)
+    {
+        _crypto  = crypto;
+        _decoder = decoder;
+    }
+
     public void Start()
     {
         _cts = new CancellationTokenSource();
@@ -43,7 +51,8 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
 
-        System.Diagnostics.Debug.WriteLine($"[Mirror] Listening for video on TCP {Port}");
+        System.Diagnostics.Debug.WriteLine(
+            $"[Mirror] Listening for video on TCP {Port} (decrypt={_crypto is not null}, decode={_decoder is not null})");
         _acceptLoop = AcceptLoopAsync(_cts.Token);
     }
 
@@ -101,8 +110,12 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
                 byte[] payload = new byte[payloadLength];
                 if (payloadLength > 0 && !await ReadFullyAsync(stream, payload, payloadLength, ct)) break;
 
-                System.Diagnostics.Debug.WriteLine($"[Mirror] frame type={payloadType} size={payloadLength}");
-                // TODO(next): type 1 → parse SPS/PPS; type 0 → AES-decrypt and feed the decoder.
+                switch (payloadType)
+                {
+                    case 0: HandleVideoFrame(payload); break;
+                    case 1: HandleCodecConfig(payload); break;
+                    default: break; // heartbeat / other — ignore
+                }
             }
         }
         catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException)
@@ -112,6 +125,78 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         finally
         {
             client.Dispose();
+        }
+    }
+
+    // ── Video (type 0): decrypt, AVCC → Annex-B, decode ───────────────────────
+
+    private void HandleVideoFrame(byte[] payload)
+    {
+        if (payload.Length == 0) return;
+
+        _crypto?.Decrypt(payload, payload.Length);
+
+        // Convert AVCC (4-byte big-endian NAL lengths) to Annex-B start codes in place.
+        if (!ConvertAvccToAnnexBInPlace(payload))
+        {
+            // Malformed after decryption almost always means the key is wrong.
+            System.Diagnostics.Debug.WriteLine("[Mirror] video frame not valid AVCC after decrypt (key mismatch?)");
+            return;
+        }
+
+        if (!_firstFrameLogged)
+        {
+            _firstFrameLogged = true;
+            int nalType = payload.Length > 4 ? payload[4] & 0x1F : -1;
+            System.Diagnostics.Debug.WriteLine(
+                $"[Mirror] first video frame decrypted OK ({payload.Length}B, first NAL type={nalType}) — decryption works");
+        }
+
+        _decoder?.SubmitPacket(payload);
+    }
+
+    private static bool ConvertAvccToAnnexBInPlace(byte[] buf)
+    {
+        int offset = 0;
+        while (offset + 4 <= buf.Length)
+        {
+            int nalLength = (buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3];
+            if (nalLength < 0 || offset + 4 + nalLength > buf.Length) return false;
+            buf[offset] = 0; buf[offset + 1] = 0; buf[offset + 2] = 0; buf[offset + 3] = 1;
+            offset += 4 + nalLength;
+        }
+        return offset == buf.Length;
+    }
+
+    // ── Codec config (type 1): avcC SPS/PPS → Annex-B ─────────────────────────
+
+    private void HandleCodecConfig(byte[] p)
+    {
+        // avcC layout: [0]=1 [1..3]=profile/compat/level [4]=lengthSizeMinusOne
+        //              [5]=numSPS [6..7]=spsLen [8..]=SPS
+        //              [..]=numPPS [..]=ppsLen [..]=PPS
+        try
+        {
+            int spsLen = (p[6] << 8) | p[7];
+            int spsOff = 8;
+            int numPpsOff = spsOff + spsLen;
+            int ppsLen = (p[numPpsOff + 1] << 8) | p[numPpsOff + 2];
+            int ppsOff = numPpsOff + 3;
+            if (ppsOff + ppsLen > p.Length) { System.Diagnostics.Debug.WriteLine("[Mirror] malformed avcC config"); return; }
+
+            byte[] annexB = new byte[4 + spsLen + 4 + ppsLen];
+            int o = 0;
+            StartCode.CopyTo(annexB, o); o += 4;
+            Buffer.BlockCopy(p, spsOff, annexB, o, spsLen); o += spsLen;
+            StartCode.CopyTo(annexB, o); o += 4;
+            Buffer.BlockCopy(p, ppsOff, annexB, o, ppsLen);
+
+            System.Diagnostics.Debug.WriteLine($"[Mirror] codec config: SPS={spsLen}B PPS={ppsLen}B");
+            _decoder?.SubmitPacket(annexB);
+        }
+        catch (IndexOutOfRangeException)
+        {
+            System.Diagnostics.Debug.WriteLine("[Mirror] malformed avcC config");
         }
     }
 
