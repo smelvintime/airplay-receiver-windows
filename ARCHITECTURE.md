@@ -164,7 +164,7 @@ A C# proof-of-concept. Not production-ready, but shows the RTSP parser pattern i
 
 ### Phase 1 — Discovery (Days 2–3)
 - Implement `MdnsService`: advertise `_airplay._tcp` and `_raop._tcp` on port 7000.
-- Set `features` bitmask to at minimum `0x527FFFF7,0x00000001` (mirrors UxPlay defaults).
+- Set `features` bitmask to `0x5A7FFFF7,0x1E` (UxPlay's known-good value). The high word `0x1E` carries the unified pair-setup / MFi capability bits that modern iOS requires before it will show the device in the Screen Mirroring picker — a high word of `0x1` lets iOS resolve the device but hides it from the list.
 - Set `deviceid` to the machine's MAC address (any adapter).
 - **Test:** open iPhone → Control Center → Screen Mirroring. Your device name should appear.
 
