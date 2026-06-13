@@ -22,6 +22,7 @@ public sealed class AirPlayService : IAsyncDisposable
     private VideoPresenter? _presenter;
     private VideoDecoder?   _decoder;
     private RtpReceiver?    _rtpReceiver;
+    private DeviceIdentity? _identity;
 
     // Callbacks into MainWindow (set via constructor — null-safe)
     private readonly MainWindow? _window;
@@ -39,6 +40,9 @@ public sealed class AirPlayService : IAsyncDisposable
     public async Task StartAsync(CancellationToken ct = default)
     {
         string deviceName = BuildDeviceName();
+
+        // ── 0. Device identity (shared by mDNS pk and the pairing handshake) ──
+        _identity = DeviceIdentity.LoadOrCreate();
 
         // ── 1. Video presenter ────────────────────────────────────────────────
         _presenter = new VideoPresenter();
@@ -75,7 +79,7 @@ public sealed class AirPlayService : IAsyncDisposable
         await _rtsp.StartAsync(ct);
 
         // ── 5. mDNS advertisement ─────────────────────────────────────────────
-        _mdns = new MdnsService(deviceName, port: 7000);
+        _mdns = new MdnsService(deviceName, _identity.PublicKeyHex, port: 7000);
         await _mdns.StartAsync(ct);
 
         System.Diagnostics.Debug.WriteLine($"[AirPlay] Service started. Advertising as '{deviceName}'");
@@ -99,7 +103,7 @@ public sealed class AirPlayService : IAsyncDisposable
 
     private AirPlaySession CreateSession()
     {
-        var pairing = new PairingHandler();
+        var pairing = new PairingHandler(_identity!);
         var session = new AirPlaySession(_rtpReceiver, pairing);
 
         session.StreamStarted += () => _window?.OnSessionStarted();
