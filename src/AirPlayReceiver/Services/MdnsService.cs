@@ -33,16 +33,15 @@ public sealed class MdnsService : IAsyncDisposable
     // Bit layout documented at:
     //   https://openairplay.github.io/airplay-spec/features.html
     //
-    // Word 1 (0x5A7FFFF7) carries the screen-mirroring + AirPlay-video/HLS bits
-    // (incl. bit 0 = video, bit 4 = HLS) and is the known-good mirroring value.
+    // Word 1 (0x5A7FFFF7) carries the screen-mirroring + AirPlay-video/HLS bits.
+    // Word 2 = 0x1E is the known-good value for the iOS Screen Mirroring picker:
+    // it keeps the receiver visible AND reconnectable after a session ends.
     //
-    // Word 2 was 0x1E, but per UxPlay's source the AirPlay-2-era bits in word 2
-    // (Video Play Queue / cloud / TLS-PSK …) steer iOS onto the *modern*
-    // pairing+encryption path it then expects us to complete (fp-setup2 v0x04),
-    // which no open-source receiver can. UxPlay keeps word 2 = 0x0 to stay on the
-    // Legacy path so iOS proceeds to POST /play for HLS video. Trying 0x0 here.
-    // NOTE: if this regresses the Screen Mirroring picker visibility, revert to 0x1E.
-    private const string AirPlayFeatures  = "0x5A7FFFF7,0x0";
+    // (We briefly tried word 2 = 0x0 — matching UxPlay, to chase HLS video-out —
+    //  but on this stack it made iOS DROP the device from the picker after the
+    //  first session, so you couldn't reconnect. Reverted. Pursue video-out via a
+    //  path that doesn't disturb word 2.)
+    private const string AirPlayFeatures  = "0x5A7FFFF7,0x1E";
     private const string AirPlayModel     = "AppleTV6,2";   // Spoofed as Apple TV 4K
     private const string AirPlayOsVersion = "14.0";         // tvOS version string
 
