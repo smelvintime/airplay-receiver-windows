@@ -50,7 +50,7 @@ public sealed class VideoDecoder : IDisposable
 
     // Kept alive for the codec context's lifetime so the GC doesn't collect the
     // managed delegate that FFmpeg invokes to negotiate the hardware pixel format.
-    private unsafe AVCodecContext_get_format _getFormatCallback;
+    private unsafe AVCodecContext_get_format? _getFormatCallback;
 
     // ── Threading ─────────────────────────────────────────────────────────────
 

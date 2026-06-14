@@ -514,8 +514,8 @@ public sealed class AirPlaySession : IAsyncDisposable
                         System.Diagnostics.Debug.WriteLine($"[Setup] phase 2: audio ct={ct} spf={spf}");
 
                         _audio = new AudioStreamReceiver();
-                        if (_streamAesKey is { } akey && _streamEiv is { } eiv)
-                            _audio.Configure(new AudioStreamCrypto(akey, _pairing.EcdhSecret, eiv));
+                        if (_streamAesKey is { } akey && _streamEiv is { } audioEiv)
+                            _audio.Configure(new AudioStreamCrypto(akey, _pairing.EcdhSecret, audioEiv));
                         else
                             System.Diagnostics.Debug.WriteLine("[Setup] audio without decryption (missing key/eiv)");
                         _audio.Start();

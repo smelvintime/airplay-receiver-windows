@@ -56,7 +56,6 @@ public sealed class RtpReceiver : IAsyncDisposable
     private byte[]? _fuBuffer;
     private int     _fuLength;
     private byte    _fuNalHeader;
-    private ushort  _lastSeq;
 
     // ── Construction ──────────────────────────────────────────────────────────
 
