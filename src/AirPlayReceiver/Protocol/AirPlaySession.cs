@@ -46,6 +46,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     // ── AirPlay 2 mirroring media state (set up during SETUP) ─────────────────
     private MirrorStreamReceiver? _mirror;        // TCP video stream
+    private AudioStreamReceiver?  _audio;         // UDP/RTP AAC-ELD audio (type 96)
     private TcpListener?          _eventListener; // event channel (accept + ignore)
     private UdpClient?            _timing;        // timing/NTP channel (minimal)
     private byte[]?               _streamEkey;    // FairPlay-encrypted stream key (from SETUP)
@@ -502,6 +503,31 @@ public sealed class AirPlaySession : IAsyncDisposable
                         ["dataPort"] = (long)_mirror.Port,
                     });
                 }
+                else if (type == 96) // screen-mirroring audio (AAC-ELD over UDP/RTP)
+                {
+                    // iOS retries this SETUP until it gets a data/control port, so
+                    // open the audio receiver once and reuse its ports on retries.
+                    if (_audio is null)
+                    {
+                        long ct  = stream.TryGetValue("ct",  out var ctv)  && ctv  is long ctl  ? ctl  : -1;
+                        long spf = stream.TryGetValue("spf", out var spfv) && spfv is long spfl ? spfl : -1;
+                        System.Diagnostics.Debug.WriteLine($"[Setup] phase 2: audio ct={ct} spf={spf}");
+
+                        _audio = new AudioStreamReceiver();
+                        if (_streamAesKey is { } akey && _streamEiv is { } eiv)
+                            _audio.Configure(new AudioStreamCrypto(akey, _pairing.EcdhSecret, eiv));
+                        else
+                            System.Diagnostics.Debug.WriteLine("[Setup] audio without decryption (missing key/eiv)");
+                        _audio.Start();
+                    }
+
+                    responseStreams.Add(new Dictionary<string, object?>
+                    {
+                        ["type"]        = (long)96,
+                        ["dataPort"]    = (long)_audio.DataPort,
+                        ["controlPort"] = (long)_audio.ControlPort,
+                    });
+                }
             }
             response["streams"] = responseStreams;
         }
@@ -763,6 +789,11 @@ public sealed class AirPlaySession : IAsyncDisposable
         {
             await _mirror.StopAsync();
             _mirror = null;
+        }
+        if (_audio is not null)
+        {
+            await _audio.DisposeAsync();
+            _audio = null;
         }
         _eventListener?.Stop();
         _eventListener = null;
