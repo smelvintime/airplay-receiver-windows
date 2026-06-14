@@ -249,10 +249,10 @@ public sealed class AirPlayVideoPlayer : IDisposable
                     // sws_scale's destination takes the 4-element array structs, while
                     // AVFrame.data/linesize are the 8-element ones — copy the two NV12
                     // planes (Y, interleaved UV) across.
-                    var dstData = new byte_ptr4();
+                    var dstData = new byte_ptrArray4();
                     dstData[0] = nv12->data[0];
                     dstData[1] = nv12->data[1];
-                    var dstLines = new int4();
+                    var dstLines = new int_array4();
                     dstLines[0] = nv12->linesize[0];
                     dstLines[1] = nv12->linesize[1];
                     ffmpeg.sws_scale(sws, frame->data, frame->linesize, 0, h, dstData, dstLines);
