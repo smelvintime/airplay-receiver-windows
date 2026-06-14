@@ -130,6 +130,9 @@ public sealed class AirPlayService : IAsyncDisposable
 
     public async ValueTask DisposeAsync() => await StopAsync();
 
+    /// <summary>Ends the current AirPlay session (disconnects the phone) but keeps advertising.</summary>
+    public void EndActiveSessions() => _rtsp?.CloseActiveConnections();
+
     // ── Session factory ───────────────────────────────────────────────────────
 
     private AirPlaySession CreateSession()
