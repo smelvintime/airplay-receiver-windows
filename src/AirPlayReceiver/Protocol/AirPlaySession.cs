@@ -649,11 +649,17 @@ public sealed class AirPlaySession : IAsyncDisposable
         return Ok(msg);
     }
 
-    /// <summary>FairPlay phase-2 for the video-out session; not implemented — ack 200 so iOS keeps going.</summary>
+    /// <summary>
+    /// FairPlay phase-2 for the video-out session: a FairPlay variant we don't
+    /// implement (UxPlay doesn't either). iOS treats this as optional and only
+    /// proceeds to /play if it's <i>cleanly rejected</i> — an empty 200 makes it
+    /// think the secure session succeeded, then abort. So reject with 421 like
+    /// UxPlay does, which lets iOS continue past it.
+    /// </summary>
     private byte[] HandleFpSetup2(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup2 received ({msg.Body?.Length ?? 0}B) — acking 200 (not implemented)");
-        return Ok(msg);
+        System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup2 received ({msg.Body?.Length ?? 0}B) — rejecting 421 (unsupported FairPlay variant)");
+        return RtspMessage.BuildResponse(421, "Misdirected Request", msg.CSeq, protocol: msg.Version);
     }
 
     // ── Plist diagnostics ──────────────────────────────────────────────────────
