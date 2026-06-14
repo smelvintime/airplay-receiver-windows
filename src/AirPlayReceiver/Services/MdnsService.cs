@@ -84,23 +84,9 @@ public sealed class MdnsService : IAsyncDisposable
                 System.Diagnostics.Debug.WriteLine($"[mDNS] Listening on interface: {nic.Name}");
         };
 
-        _mdns.QueryReceived += (_, e) =>
-        {
-            try
-            {
-                foreach (var q in e.Message.Questions)
-                {
-                    string name = q.Name.ToString();
-                    if (name.Contains("airplay", StringComparison.OrdinalIgnoreCase) ||
-                        name.Contains("raop",    StringComparison.OrdinalIgnoreCase))
-                    {
-                        System.Diagnostics.Debug.WriteLine(
-                            $"[mDNS] Query from {e.RemoteEndPoint}: {q.Type} {name}");
-                    }
-                }
-            }
-            catch { /* diagnostic logging only — never let it throw */ }
-        };
+        // Per-query logging was invaluable while bringing discovery up, but iOS
+        // polls these names several times a second, and the noise buries the RTSP
+        // and video logs. Discovery is stable now, so we no longer log every query.
 
         RegisterAirPlayService();
         RegisterRaopService();
