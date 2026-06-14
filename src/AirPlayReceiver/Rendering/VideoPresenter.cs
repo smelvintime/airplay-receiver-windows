@@ -53,6 +53,7 @@ public sealed unsafe class VideoPresenter : IDisposable
     private int  _swapChainHeight;
     private int  _frameWidth;
     private int  _frameHeight;
+    private long _presentCount;    // frames presented, for periodic progress logging
     private bool _active = true;   // when false, drop frames and keep the surface black
 
     // ── Initialisation ────────────────────────────────────────────────────────
@@ -178,6 +179,9 @@ public sealed unsafe class VideoPresenter : IDisposable
             _context.Draw(3, 0);
 
             _swapChain.Present(1, PresentFlags.None);
+
+            if (++_presentCount % 60 == 0)
+                System.Diagnostics.Debug.WriteLine($"[Renderer] presented {_presentCount} frames ({w}×{h})");
         }
     }
 

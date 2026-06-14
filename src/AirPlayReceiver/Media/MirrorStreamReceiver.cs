@@ -33,6 +33,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
     private MirrorStreamCrypto? _crypto;   // null → no decryption (frames only logged)
     private VideoDecoder?       _decoder;  // null → no decode
     private bool                _firstFrameLogged;
+    private byte[]?             _spsPps;   // cached Annex-B SPS+PPS, prepended to each IDR
 
     /// <summary>The TCP port the OS assigned; returned to iOS in the SETUP response.</summary>
     public int Port { get; private set; }
@@ -144,15 +145,28 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             return;
         }
 
+        int firstNalType = payload.Length > 4 ? payload[4] & 0x1F : -1;
+
         if (!_firstFrameLogged)
         {
             _firstFrameLogged = true;
-            int nalType = payload.Length > 4 ? payload[4] & 0x1F : -1;
             System.Diagnostics.Debug.WriteLine(
-                $"[Mirror] first video frame decrypted OK ({payload.Length}B, first NAL type={nalType}) — decryption works");
+                $"[Mirror] first video frame decrypted OK ({payload.Length}B, first NAL type={firstNalType}) — decryption works");
         }
 
-        _decoder?.SubmitPacket(payload);
+        // Prepend the cached SPS/PPS to every IDR keyframe (NAL type 5). The decoder
+        // is opened once for the whole app and reused across sessions, so without the
+        // parameter sets attached to each keyframe it decodes the very first IDR and
+        // then can't resync — which shows up as a single frozen frame.
+        byte[] toDecode = payload;
+        if (firstNalType == 5 && _spsPps is { Length: > 0 })
+        {
+            toDecode = new byte[_spsPps.Length + payload.Length];
+            Buffer.BlockCopy(_spsPps, 0, toDecode, 0, _spsPps.Length);
+            Buffer.BlockCopy(payload, 0, toDecode, _spsPps.Length, payload.Length);
+        }
+
+        _decoder?.SubmitPacket(toDecode);
     }
 
     private static bool ConvertAvccToAnnexBInPlace(byte[] buf)
@@ -191,8 +205,11 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             StartCode.CopyTo(annexB, o); o += 4;
             Buffer.BlockCopy(p, ppsOff, annexB, o, ppsLen);
 
-            System.Diagnostics.Debug.WriteLine($"[Mirror] codec config: SPS={spsLen}B PPS={ppsLen}B");
-            _decoder?.SubmitPacket(annexB);
+            // Cache the parameter sets and prepend them to each IDR (see HandleVideoFrame)
+            // instead of submitting them as a standalone packet — a packet that contains
+            // only SPS/PPS and no slice makes the decoder return INVALIDDATA.
+            _spsPps = annexB;
+            System.Diagnostics.Debug.WriteLine($"[Mirror] codec config: SPS={spsLen}B PPS={ppsLen}B (cached for keyframes)");
         }
         catch (IndexOutOfRangeException)
         {
