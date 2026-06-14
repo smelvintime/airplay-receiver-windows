@@ -2,6 +2,7 @@ using AirPlayReceiver.Media;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -144,7 +145,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             "/scrub"       => HandleScrub(msg),
             "/stop"        => HandleStop(msg),
             "/reverse"     => HandleReverse(msg),
-            "/action"      => Ok(msg),
+            "/action"      => HandleAction(msg),
             "/feedback"    => Ok(msg),
             _ => RtspMessage.BuildResponse(404, "Not Found", msg.CSeq, protocol: msg.Version),
         };
@@ -177,12 +178,19 @@ public sealed class AirPlaySession : IAsyncDisposable
         string? url = null;
         double  start = 0;
 
+        // Full diagnostic dump: headers (X-Apple-Session-ID etc.) + the entire plist,
+        // so we can see whether Content-Location is a direct URL or an HLS
+        // …/master.m3u8 (which needs the FCUP reverse-proxy path).
+        LogVideoHeaders(msg);
+
         try
         {
             if (body.Length >= 8 && Encoding.ASCII.GetString(body, 0, 8) == "bplist00" &&
                 BinaryPlist.Parse(body) is Dictionary<string, object?> dict)
             {
-                System.Diagnostics.Debug.WriteLine($"[Video] /play plist keys: {string.Join(", ", dict.Keys)}");
+                var dump = new StringBuilder();
+                DumpPlist(dict, dump, 1);
+                System.Diagnostics.Debug.WriteLine($"[Video] /play plist ({body.Length}B):\n{dump}");
                 url = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
                 if (dict.TryGetValue("Start-Position", out var sp))
                     start = sp switch { double d => d, long l => (double)l, _ => 0.0 };
@@ -246,6 +254,8 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// <summary>The reverse-HTTP event channel: ack with a protocol switch and keep the connection open.</summary>
     private byte[] HandleReverse(RtspMessage msg)
     {
+        System.Diagnostics.Debug.WriteLine("[Video] /reverse — opening PTTH event channel");
+        LogVideoHeaders(msg);
         var headers = new Dictionary<string, string>
         {
             ["Upgrade"]    = "PTTH/1.0",
@@ -254,8 +264,35 @@ public sealed class AirPlaySession : IAsyncDisposable
         return RtspMessage.BuildResponse(101, "Switching Protocols", msg.CSeq, headers, protocol: msg.Version);
     }
 
+    /// <summary>
+    /// POST /action carries FCUP responses — the iOS device returning HLS playlist
+    /// bytes over the control channel (FCUP_Response_URL / FCUP_Response_Data / …),
+    /// plus other actions. Dump it so we can see the playlist flow.
+    /// </summary>
+    private byte[] HandleAction(RtspMessage msg)
+    {
+        LogVideoHeaders(msg);
+        byte[] body = msg.Body ?? Array.Empty<byte>();
+        if (body.Length >= 8 && Encoding.ASCII.GetString(body, 0, 8) == "bplist00")
+        {
+            try
+            {
+                var dump = new StringBuilder();
+                DumpPlist(BinaryPlist.Parse(body), dump, 1);
+                System.Diagnostics.Debug.WriteLine($"[Video] /action plist ({body.Length}B):\n{dump}");
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[Video] /action parse failed: {ex.Message}"); }
+        }
+        else
+        {
+            System.Diagnostics.Debug.WriteLine($"[Video] /action non-plist body ({body.Length}B)");
+        }
+        return Ok(msg);
+    }
+
     private byte[] HandlePlaybackInfo(RtspMessage msg)
     {
+        System.Diagnostics.Debug.WriteLine($"[Video] GET /playback-info (ready={_videoPlayer.ReadyToPlay} pos={_videoPlayer.Position:F1} dur={_videoPlayer.Duration:F1})");
         var info = new Dictionary<string, object?>
         {
             ["duration"]                = _videoPlayer.Duration,
@@ -551,7 +588,18 @@ public sealed class AirPlaySession : IAsyncDisposable
         return BuildOk(msg.CSeq);
     }
 
-    private byte[] HandleGetProperty(RtspMessage msg)   => BuildOk(msg.CSeq);
+    private byte[] HandleGetProperty(RtspMessage msg)
+    {
+        System.Diagnostics.Debug.WriteLine($"[Video] getProperty {msg.Uri}");
+        return BuildOk(msg.CSeq);
+    }
+
+    /// <summary>Dumps a video-out request's headers — the FCUP path keys off X-Apple-Session-ID and friends.</summary>
+    private static void LogVideoHeaders(RtspMessage msg)
+    {
+        string hdrs = string.Join("\n  ", msg.Headers.Select(kv => $"{kv.Key}: {kv.Value}"));
+        System.Diagnostics.Debug.WriteLine($"[Video] {msg.Method} {msg.Uri} headers:\n  {hdrs}");
+    }
 
     /// <summary>
     /// AirPlay video-out hands the receiver its media via <c>setProperty?selectedMediaArray</c>
@@ -647,7 +695,9 @@ public sealed class AirPlaySession : IAsyncDisposable
     {
         null            => "null",
         byte[] b        => $"<{b.Length} bytes>",
-        string s        => $"\"{s}\"",
+        // Truncate long strings (e.g. an embedded media playlist) so one value
+        // can't flood the Output window, but keep enough to read the shape.
+        string s        => s.Length > 2000 ? $"\"{s[..2000]}…\"(+{s.Length - 2000} more)" : $"\"{s}\"",
         _               => v.ToString() ?? "null",
     };
 
