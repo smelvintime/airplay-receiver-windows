@@ -34,7 +34,6 @@ public sealed unsafe class VideoPresenter : IDisposable
     private SharpDX.Direct3D11.Device  _device      = null!;
     private DeviceContext               _context     = null!;
     private SwapChain1                  _swapChain   = null!;
-    private RenderTargetView            _rtv         = null!;
     private VertexShader                _vs          = null!;
     private PixelShader                 _ps          = null!;
     private SamplerState                _sampler     = null!;
@@ -108,9 +107,6 @@ public sealed unsafe class VideoPresenter : IDisposable
         _swapChainWidth  = initialWidth;
         _swapChainHeight = initialHeight;
 
-        // ── Render target view ────────────────────────────────────────────────
-        CreateRenderTargetView();
-
         // ── Shaders ───────────────────────────────────────────────────────────
         CompileShaders();
 
@@ -165,8 +161,13 @@ public sealed unsafe class VideoPresenter : IDisposable
             _context.UpdateSubresource(new DataBox(yPtr,  yPitch,  yPitch  * h),       _yTex!,  0);
             _context.UpdateSubresource(new DataBox(uvPtr, uvPitch, uvPitch * (h / 2)), _uvTex!, 0);
 
-            _context.OutputMerger.SetRenderTargets(_rtv);
-            _context.ClearRenderTargetView(_rtv, new RawColor4(0, 0, 0, 1));
+            // Flip-model swap chains rotate the back buffer on every Present, so the
+            // render target must be re-acquired each frame — a single cached RTV would
+            // only ever update the first presented frame.
+            using var backBuffer = _swapChain.GetBackBuffer<Texture2D>(0);
+            using var rtv        = new RenderTargetView(_device, backBuffer);
+            _context.OutputMerger.SetRenderTargets(rtv);
+            _context.ClearRenderTargetView(rtv, new RawColor4(0, 0, 0, 1));
 
             _context.VertexShader.Set(_vs);
             _context.PixelShader.Set(_ps);
@@ -197,8 +198,10 @@ public sealed unsafe class VideoPresenter : IDisposable
             _active = active;
             if (!active)
             {
-                _context.OutputMerger.SetRenderTargets(_rtv);
-                _context.ClearRenderTargetView(_rtv, new RawColor4(0, 0, 0, 1));
+                using var backBuffer = _swapChain.GetBackBuffer<Texture2D>(0);
+                using var rtv        = new RenderTargetView(_device, backBuffer);
+                _context.OutputMerger.SetRenderTargets(rtv);
+                _context.ClearRenderTargetView(rtv, new RawColor4(0, 0, 0, 1));
                 _swapChain.Present(1, PresentFlags.None);
             }
         }
@@ -213,8 +216,6 @@ public sealed unsafe class VideoPresenter : IDisposable
 
         lock (_renderLock)
         {
-            _rtv.Dispose();
-
             _swapChain.ResizeBuffers(
                 bufferCount: 2,
                 width, height,
@@ -224,7 +225,8 @@ public sealed unsafe class VideoPresenter : IDisposable
             _swapChainWidth  = width;
             _swapChainHeight = height;
 
-            CreateRenderTargetView();
+            // The back-buffer RTV is acquired per frame in PresentFrame, so there's
+            // nothing to recreate here after resizing the buffers.
             _context.Rasterizer.SetViewport(0, 0, width, height);
         }
 
@@ -248,12 +250,6 @@ public sealed unsafe class VideoPresenter : IDisposable
             AlphaMode         = AlphaMode.Premultiplied,
             Flags             = SwapChainFlags.None,
         };
-
-    private void CreateRenderTargetView()
-    {
-        using var backBuffer = _swapChain.GetBackBuffer<Texture2D>(0);
-        _rtv = new RenderTargetView(_device, backBuffer);
-    }
 
     /// <summary>
     /// (Re)creates the NV12 upload textures and their SRVs when the frame size
@@ -357,7 +353,6 @@ public sealed unsafe class VideoPresenter : IDisposable
         _sampler.Dispose();
         _ps.Dispose();
         _vs.Dispose();
-        _rtv.Dispose();
         _swapChain.Dispose();
         _context.Dispose();
         _device.Dispose();
