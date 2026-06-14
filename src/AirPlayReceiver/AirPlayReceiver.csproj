@@ -34,6 +34,9 @@
     <!-- mDNS / DNS-SD -->
     <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
 
+    <!-- WASAPI audio output for the screen-mirroring AAC-ELD audio stream -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+
     <!-- FFmpeg bindings. Version maps to the native FFmpeg major version:
          7.1.x binds FFmpeg 7.x (avcodec-61, avutil-59, swscale-8, ...). The
          native DLLs you drop into native\x64\ MUST be a matching FFmpeg 7.x
