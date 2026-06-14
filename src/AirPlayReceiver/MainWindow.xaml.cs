@@ -1,9 +1,11 @@
 using AirPlayReceiver.Rendering;
+using AirPlayReceiver.Services;
 using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Input;
 using System;
+using System.Runtime.InteropServices;
 using Windows.Graphics;
 
 namespace AirPlayReceiver;
@@ -32,6 +34,13 @@ public sealed partial class MainWindow : Window
     private readonly AppWindow _appWindow;
     private bool _isFullscreen;
 
+    // System-tray integration for background operation.
+    private TrayIcon? _tray;
+    private bool      _allowClose;
+
+    /// <summary>Raised when the user chooses Exit from the tray menu (real shutdown).</summary>
+    public event Action? ExitRequested;
+
     // Last stream dimensions reported by the decoder (default 16:9 until known).
     private double _streamWidth  = 1920;
     private double _streamHeight = 1080;
@@ -57,7 +66,48 @@ public sealed partial class MainWindow : Window
 
         // ── Layout ───────────────────────────────────────────────────────────
         RootGrid.SizeChanged += RootGrid_SizeChanged;
+
+        // ── System tray (background operation) ───────────────────────────────
+        // Closing the window hides it to the tray instead of quitting, so the
+        // AirPlay service keeps advertising. Only the tray's Exit shuts down.
+        IntPtr hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        string iconPath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+        _tray = new TrayIcon(hwnd, "AirPlay Receiver", iconPath, ShowFromTray, RequestExit);
+
+        _appWindow.Closing += OnAppWindowClosing;
     }
+
+    // ── Tray / background lifecycle ────────────────────────────────────────────
+
+    private void OnAppWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    {
+        if (_allowClose) return;   // real exit via the tray menu
+        args.Cancel = true;        // otherwise: keep running, just hide to tray
+        _appWindow.Hide();
+    }
+
+    /// <summary>Restores the window from the tray and brings it to the foreground.</summary>
+    public void ShowFromTray()
+    {
+        _appWindow.Show();
+        if (_appWindow.Presenter is OverlappedPresenter p) p.Restore();
+        this.Activate();
+        SetForegroundWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
+    }
+
+    /// <summary>Hides the window to the tray; the AirPlay service keeps running.</summary>
+    public void HideToTray() => _appWindow.Hide();
+
+    private void RequestExit()
+    {
+        _allowClose = true;
+        _tray?.Dispose();
+        _tray = null;
+        ExitRequested?.Invoke();
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     // ── Custom title bar ──────────────────────────────────────────────────────
 
