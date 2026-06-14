@@ -30,13 +30,15 @@ public partial class App : Application
         StartupManager.Enable();
 
         _window = new MainWindow();
+        _window.ExitRequested += OnExitRequested;
         _window.Activate();
 
-        // When launched at sign-in, come up minimized so we stay out of the way.
+        // When launched at sign-in, come up hidden in the system tray so the
+        // receiver runs fully in the background, advertising and ready to connect.
         bool launchMinimized = Environment.GetCommandLineArgs()
             .Any(a => string.Equals(a, StartupManager.MinimizedArg, StringComparison.OrdinalIgnoreCase));
-        if (launchMinimized && _window.AppWindow.Presenter is OverlappedPresenter presenter)
-            presenter.Minimize();
+        if (launchMinimized)
+            _window.HideToTray();
 
         // Boot the AirPlay service stack (mDNS + RTSP server).
         // Pass the window so the decoder/session can drive the HUD and overlays.
@@ -52,10 +54,17 @@ public partial class App : Application
             System.Diagnostics.Debug.WriteLine($"[App] AirPlay service failed to start: {ex}");
         }
 
-        _window.Closed += async (_, _) =>
-        {
-            if (_airPlayService is not null)
-                await _airPlayService.StopAsync();
-        };
+    }
+
+    /// <summary>
+    /// Real shutdown, requested from the tray menu. Closing the window only hides
+    /// it to the tray (see <see cref="MainWindow"/>), so this is the single path
+    /// that stops the AirPlay service and exits the process.
+    /// </summary>
+    private async void OnExitRequested()
+    {
+        if (_airPlayService is not null)
+            await _airPlayService.StopAsync();
+        Application.Current.Exit();
     }
 }
