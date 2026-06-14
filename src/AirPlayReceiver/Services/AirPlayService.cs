@@ -25,8 +25,9 @@ public sealed class AirPlayService : IAsyncDisposable
     private DeviceIdentity? _identity;
     private DeviceInfo?     _deviceInfo;
 
-    // Shared AirPlay Video (URL playback) state, referenced by every session.
-    private readonly AirPlayVideoPlayer _videoPlayer = new();
+    // Shared AirPlay Video (URL playback) player, referenced by every session.
+    // Constructed in StartAsync once the presenter it renders to exists.
+    private AirPlayVideoPlayer? _videoPlayer;
 
     // 64-bit form of the mDNS "features" value 0x5A7FFFF7,0x1E  → (0x1E << 32) | 0x5A7FFFF7.
     private const long AirPlayFeatures64 = 0x1E5A7FFFF7L;
@@ -64,6 +65,18 @@ public sealed class AirPlayService : IAsyncDisposable
         // ── 1. Video presenter ────────────────────────────────────────────────
         _presenter = new VideoPresenter();
         _presenter.Initialize(_panel);
+
+        // AirPlay Video (URL playback) renders to the same presenter as mirroring.
+        // The two modes are mutually exclusive, so they can share the surface.
+        _videoPlayer = new AirPlayVideoPlayer(
+            onFrame:      framePtr => _presenter!.PresentFrame(framePtr),
+            onDimensions: (w, h)   => _window?.UpdateStreamDimensions(w, h),
+            onActive:     active   =>
+            {
+                if (active) _window?.OnSessionStarted();
+                else        _window?.OnSessionEnded();
+                _presenter?.SetActive(active);
+            });
 
         // ── 2. Video decoder + RTP receiver ───────────────────────────────────
         // FFmpeg is optional on first launch: if the native DLLs aren't present
@@ -108,6 +121,7 @@ public sealed class AirPlayService : IAsyncDisposable
         if (_rtsp    is not null) await _rtsp.StopAsync();
         if (_decoder is not null) await _decoder.StopAsync();
 
+        _videoPlayer?.Dispose();
         _presenter?.Dispose();
         _decoder?.Dispose();
 
@@ -121,7 +135,7 @@ public sealed class AirPlayService : IAsyncDisposable
     private AirPlaySession CreateSession()
     {
         var pairing = new PairingHandler(_identity!);
-        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer);
+        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!);
 
         session.StreamStarted += () => { _window?.OnSessionStarted(); _presenter?.SetActive(true); };
         session.StreamStopped += () => { _window?.OnSessionEnded();   _presenter?.SetActive(false); };
