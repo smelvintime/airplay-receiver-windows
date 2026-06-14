@@ -651,15 +651,24 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     /// <summary>
     /// FairPlay phase-2 for the video-out session: a FairPlay variant we don't
-    /// implement (UxPlay doesn't either). iOS treats this as optional and only
-    /// proceeds to /play if it's <i>cleanly rejected</i> — an empty 200 makes it
-    /// think the secure session succeeded, then abort. So reject with 421 like
-    /// UxPlay does, which lets iOS continue past it.
+    /// implement (UxPlay doesn't either). We reject with 421 (matching UxPlay,
+    /// with the binary-plist content type, keeping the connection alive) so iOS
+    /// can fall back to the Legacy path and proceed to /play.
+    ///
+    /// The FairPlay version is at byte 4 of the body: 0x03 is the variant UxPlay's
+    /// /fp-setup handles and that should fall back; anything else (e.g. 0x04) means
+    /// iOS wants a newer FairPlay we can't do, and playback won't be possible.
     /// </summary>
     private byte[] HandleFpSetup2(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup2 received ({msg.Body?.Length ?? 0}B) — rejecting 421 (unsupported FairPlay variant)");
-        return RtspMessage.BuildResponse(421, "Misdirected Request", msg.CSeq, protocol: msg.Version);
+        byte[] body = msg.Body ?? Array.Empty<byte>();
+        int version = body.Length > 4 ? body[4] : -1;
+        string note = version == 0x03 ? "v0x03 (should fall back to Legacy)"
+                                      : $"v0x{version:X2} — NOT 0x03, playback likely impossible";
+        System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup2 ({body.Length}B, FairPlay {note}) — rejecting 421");
+
+        var headers = new Dictionary<string, string> { ["Content-Type"] = "application/x-apple-binary-plist" };
+        return RtspMessage.BuildResponse(421, "Misdirected Request", msg.CSeq, headers, protocol: msg.Version);
     }
 
     // ── Plist diagnostics ──────────────────────────────────────────────────────

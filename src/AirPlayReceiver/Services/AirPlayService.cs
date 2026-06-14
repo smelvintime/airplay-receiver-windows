@@ -29,8 +29,9 @@ public sealed class AirPlayService : IAsyncDisposable
     // Constructed in StartAsync once the presenter it renders to exists.
     private AirPlayVideoPlayer? _videoPlayer;
 
-    // 64-bit form of the mDNS "features" value 0x5A7FFFF7,0x1E  → (0x1E << 32) | 0x5A7FFFF7.
-    private const long AirPlayFeatures64 = 0x1E5A7FFFF7L;
+    // Must match the mDNS "features" TXT value (MdnsService.AirPlayFeatures).
+    // Word 2 is 0x0 (Legacy path for HLS video-out); word 1 = 0x5A7FFFF7.
+    private const long AirPlayFeatures64 = 0x5A7FFFF7L;
 
     // Callbacks into MainWindow (set via constructor — null-safe)
     private readonly MainWindow? _window;
