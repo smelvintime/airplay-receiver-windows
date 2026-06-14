@@ -1,5 +1,6 @@
 using AirPlayReceiver.Protocol;
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -28,6 +29,9 @@ public sealed class RtspServer : IAsyncDisposable
     private TcpListener?          _listener;
     private CancellationTokenSource? _cts;
     private Task?                 _acceptLoop;
+
+    // Live client connections, so the UI can end the current session on demand.
+    private readonly ConcurrentDictionary<TcpClient, byte> _clients = new();
 
     public event Action<AirPlaySession>? SessionStarted;
     public event Action<AirPlaySession>? SessionEnded;
@@ -63,6 +67,20 @@ public sealed class RtspServer : IAsyncDisposable
 
     public async ValueTask DisposeAsync() => await StopAsync();
 
+    /// <summary>
+    /// Forcibly closes any live client connections, ending the current AirPlay
+    /// session (the phone sees the receiver disconnect). Used when the user closes
+    /// the window — we drop the session but keep advertising for the next connect.
+    /// </summary>
+    public void CloseActiveConnections()
+    {
+        foreach (var client in _clients.Keys)
+        {
+            try { client.Close(); }   // unblocks the session's ReadAsync → RunAsync ends
+            catch { /* already gone */ }
+        }
+    }
+
     // ── Accept loop ───────────────────────────────────────────────────────────
 
     private async Task AcceptLoopAsync(CancellationToken ct)
@@ -94,6 +112,7 @@ public sealed class RtspServer : IAsyncDisposable
         System.Diagnostics.Debug.WriteLine($"[RTSP] Connection from {remote}");
 
         var session = _sessionFactory();
+        _clients.TryAdd(client, 0);
         SessionStarted?.Invoke(session);
 
         try
@@ -101,12 +120,14 @@ public sealed class RtspServer : IAsyncDisposable
             using var stream = client.GetStream();
             await session.RunAsync(stream, ct);
         }
-        catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException)
+        catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or ObjectDisposedException)
         {
+            // ObjectDisposedException is expected when CloseActiveConnections() drops us.
             System.Diagnostics.Debug.WriteLine($"[RTSP] Session ended ({remote}): {ex.Message}");
         }
         finally
         {
+            _clients.TryRemove(client, out _);
             client.Dispose();
             SessionEnded?.Invoke(session);
             System.Diagnostics.Debug.WriteLine($"[RTSP] Closed {remote}");

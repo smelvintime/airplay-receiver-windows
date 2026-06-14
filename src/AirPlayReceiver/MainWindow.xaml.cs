@@ -37,9 +37,13 @@ public sealed partial class MainWindow : Window
     // System-tray integration for background operation.
     private TrayIcon? _tray;
     private bool      _allowClose;
+    private bool      _sessionActive;   // a phone is currently mirroring
 
     /// <summary>Raised when the user chooses Exit from the tray menu (real shutdown).</summary>
     public event Action? ExitRequested;
+
+    /// <summary>Raised when the window is closed during a live session — end it (disconnect the phone).</summary>
+    public event Action? SessionEndRequested;
 
     // Last stream dimensions reported by the decoder (default 16:9 until known).
     private double _streamWidth  = 1920;
@@ -81,9 +85,11 @@ public sealed partial class MainWindow : Window
 
     private void OnAppWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
     {
-        if (_allowClose) return;   // real exit via the tray menu
-        args.Cancel = true;        // otherwise: keep running, just hide to tray
-        _appWindow.Hide();
+        if (_allowClose) return;          // real exit via the tray menu
+        args.Cancel = true;               // otherwise: keep running in the background
+        if (_sessionActive)
+            SessionEndRequested?.Invoke(); // disconnect the phone (end the session)
+        _appWindow.Hide();                // drop back to the tray, still advertising
     }
 
     /// <summary>Restores the window from the tray and brings it to the foreground.</summary>
@@ -156,7 +162,9 @@ public sealed partial class MainWindow : Window
     {
         DispatcherQueue.TryEnqueue(() =>
         {
+            _sessionActive = true;
             IdleOverlay.Visibility = Visibility.Collapsed;
+            ShowFromTray();   // auto-open so the mirrored screen is visible on connect
         });
     }
 
@@ -167,6 +175,7 @@ public sealed partial class MainWindow : Window
     {
         DispatcherQueue.TryEnqueue(() =>
         {
+            _sessionActive = false;
             IdleOverlay.Visibility = Visibility.Visible;
             InfoHud.Visibility     = Visibility.Collapsed;
         });
