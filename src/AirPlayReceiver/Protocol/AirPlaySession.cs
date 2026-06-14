@@ -73,35 +73,45 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// </summary>
     public async Task RunAsync(Stream stream, CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested)
+        try
         {
-            RtspMessage? msg = await RtspMessage.ReadAsync(stream, ct);
-            if (msg is null) break; // client closed connection
-
-            System.Diagnostics.Debug.WriteLine($"[RTSP→] {msg}");
-
-            byte[] response = msg.Method switch
+            while (!ct.IsCancellationRequested)
             {
-                "OPTIONS"       => HandleOptions(msg),
-                "GET"           => HandleGet(msg),
-                "GET_PARAMETER" => HandleGetParameter(msg),
-                "POST"          => HandlePost(msg),
-                "PUT"           => HandlePut(msg),
-                "SETUP"         => HandleSetup(msg),
-                "RECORD"        => HandleRecord(msg),
-                "SET_PARAMETER" => HandleSetParameter(msg),
-                "FLUSH"         => HandleFlush(msg),
-                "TEARDOWN"      => HandleTeardown(msg),
-                _               => BuildOk(msg.CSeq),
-            };
+                RtspMessage? msg = await RtspMessage.ReadAsync(stream, ct);
+                if (msg is null) break; // client closed connection
 
-            System.Diagnostics.Debug.WriteLine($"[RTSP←] {response.Length}B");
-            await stream.WriteAsync(response, ct);
+                System.Diagnostics.Debug.WriteLine($"[RTSP→] {msg}");
 
-            if (msg.Method == "TEARDOWN") break;
+                byte[] response = msg.Method switch
+                {
+                    "OPTIONS"       => HandleOptions(msg),
+                    "GET"           => HandleGet(msg),
+                    "GET_PARAMETER" => HandleGetParameter(msg),
+                    "POST"          => HandlePost(msg),
+                    "PUT"           => HandlePut(msg),
+                    "SETUP"         => HandleSetup(msg),
+                    "RECORD"        => HandleRecord(msg),
+                    "SET_PARAMETER" => HandleSetParameter(msg),
+                    "FLUSH"         => HandleFlush(msg),
+                    "TEARDOWN"      => HandleTeardown(msg),
+                    _               => BuildOk(msg.CSeq),
+                };
+
+                System.Diagnostics.Debug.WriteLine($"[RTSP←] {response.Length}B");
+                await stream.WriteAsync(response, ct);
+
+                if (msg.Method == "TEARDOWN") break;
+            }
         }
-
-        await StopStreamAsync();
+        finally
+        {
+            // Always clean up, even when the connection drops mid-stream (the read
+            // loop throws IOException on an abrupt disconnect). Otherwise the RTP
+            // port (7011) is never released — so the next session's RECORD fails to
+            // rebind and reconnect breaks — and the presenter/overlay never reset,
+            // leaving the last frame frozen instead of returning to idle.
+            await StopStreamAsync();
+        }
     }
 
     // ── RTSP verb handlers ────────────────────────────────────────────────────
