@@ -135,6 +135,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             "/pair-verify" => _pairing.HandlePairVerify(msg),
             "/pair-add"    => _pairing.HandlePairAdd(msg),
             "/fp-setup"    => _pairing.HandleFairPlaySetup(msg),
+            "/fp-setup2"   => HandleFpSetup2(msg),
             "/getProperty" => HandleGetProperty(msg),
             "/setProperty" => HandleSetProperty(msg),
             // ── AirPlay Video control ─────────────────────────────────────────
@@ -551,7 +552,121 @@ public sealed class AirPlaySession : IAsyncDisposable
     }
 
     private byte[] HandleGetProperty(RtspMessage msg)   => BuildOk(msg.CSeq);
-    private byte[] HandleSetProperty(RtspMessage msg)   => BuildOk(msg.CSeq);
+
+    /// <summary>
+    /// AirPlay video-out hands the receiver its media via <c>setProperty?selectedMediaArray</c>
+    /// (a binary plist), not the older <c>POST /play</c> verb that newer iOS only uses for
+    /// some apps. Dump every setProperty plist so we can see what iOS sends, and when it's the
+    /// media array, pull out the playable URL and start the player.
+    /// </summary>
+    private byte[] HandleSetProperty(RtspMessage msg)
+    {
+        string prop = msg.Uri.Contains('?') ? msg.Uri[(msg.Uri.IndexOf('?') + 1)..] : "(none)";
+        byte[] body = msg.Body ?? Array.Empty<byte>();
+
+        if (body.Length >= 8 && Encoding.ASCII.GetString(body, 0, 8) == "bplist00")
+        {
+            try
+            {
+                object? parsed = BinaryPlist.Parse(body);
+                var sb = new StringBuilder();
+                DumpPlist(parsed, sb, 1);
+                System.Diagnostics.Debug.WriteLine($"[Video] setProperty '{prop}' ({body.Length}B):\n{sb}");
+
+                if (prop.Equals("selectedMediaArray", StringComparison.OrdinalIgnoreCase))
+                {
+                    var urls = new List<string>();
+                    CollectUrls(parsed, urls);
+                    if (urls.Count > 0)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[Video] selectedMediaArray URL(s): {string.Join(", ", urls)}");
+                        _videoPlayer.Play(urls[0], 0);
+                    }
+                    else
+                    {
+                        System.Diagnostics.Debug.WriteLine("[Video] selectedMediaArray had no http(s) URL — dump above shows what iOS sent");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Video] setProperty '{prop}' plist parse failed: {ex.Message}");
+            }
+        }
+        else
+        {
+            System.Diagnostics.Debug.WriteLine($"[Video] setProperty '{prop}' non-plist body ({body.Length}B)");
+        }
+
+        return Ok(msg);
+    }
+
+    /// <summary>FairPlay phase-2 for the video-out session; not implemented — ack 200 so iOS keeps going.</summary>
+    private byte[] HandleFpSetup2(RtspMessage msg)
+    {
+        System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup2 received ({msg.Body?.Length ?? 0}B) — acking 200 (not implemented)");
+        return Ok(msg);
+    }
+
+    // ── Plist diagnostics ──────────────────────────────────────────────────────
+
+    private static void DumpPlist(object? node, StringBuilder sb, int indent)
+    {
+        string pad = new(' ', indent * 2);
+        switch (node)
+        {
+            case Dictionary<string, object?> d:
+                foreach (var (k, v) in d)
+                {
+                    if (v is Dictionary<string, object?> or List<object?>)
+                    {
+                        sb.AppendLine($"{pad}{k}:");
+                        DumpPlist(v, sb, indent + 1);
+                    }
+                    else sb.AppendLine($"{pad}{k} = {Scalar(v)}");
+                }
+                break;
+            case List<object?> list:
+                for (int i = 0; i < list.Count; i++)
+                {
+                    if (list[i] is Dictionary<string, object?> or List<object?>)
+                    {
+                        sb.AppendLine($"{pad}[{i}]:");
+                        DumpPlist(list[i], sb, indent + 1);
+                    }
+                    else sb.AppendLine($"{pad}[{i}] = {Scalar(list[i])}");
+                }
+                break;
+            default:
+                sb.AppendLine($"{pad}{Scalar(node)}");
+                break;
+        }
+    }
+
+    private static string Scalar(object? v) => v switch
+    {
+        null            => "null",
+        byte[] b        => $"<{b.Length} bytes>",
+        string s        => $"\"{s}\"",
+        _               => v.ToString() ?? "null",
+    };
+
+    private static void CollectUrls(object? node, List<string> urls)
+    {
+        switch (node)
+        {
+            case Dictionary<string, object?> d:
+                foreach (var v in d.Values) CollectUrls(v, urls);
+                break;
+            case List<object?> list:
+                foreach (var v in list) CollectUrls(v, urls);
+                break;
+            case string s when s.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                            || s.StartsWith("https://", StringComparison.OrdinalIgnoreCase):
+                urls.Add(s);
+                break;
+        }
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
