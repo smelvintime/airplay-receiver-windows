@@ -59,6 +59,7 @@ public sealed class VideoDecoder : IDisposable
     private Task? _decodeTask;
     private int _lastWidth;
     private int _lastHeight;
+    private long _frameCount;   // decoded frames, for periodic progress logging
 
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -256,6 +257,9 @@ public sealed class VideoDecoder : IDisposable
             // Invoke the render callback (VideoPresenter). The pointer is passed
             // as an IntPtr because Action<> can't take a pointer type argument.
             _onFrame((IntPtr)outFrame);
+
+            if (++_frameCount % 60 == 0)
+                System.Diagnostics.Debug.WriteLine($"[Decoder] decoded {_frameCount} frames ({_lastWidth}×{_lastHeight})");
 
             if (transferred) ffmpeg.av_frame_unref(_swFrame);
             ffmpeg.av_frame_unref(_frame);
