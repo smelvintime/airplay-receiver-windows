@@ -190,10 +190,17 @@ public sealed class VideoDecoder : IDisposable
         {
             foreach (byte[] data in _packetQueue.GetConsumingEnumerable(_cts!.Token))
             {
-                DecodePacket(data);
+                try { DecodePacket(data); }
+                catch (Exception ex)
+                {
+                    // A single bad packet (e.g. during a mid-stream resolution switch)
+                    // must not fault the decode thread and crash the whole process.
+                    System.Diagnostics.Debug.WriteLine($"[Decoder] decode error (skipped): {ex.Message}");
+                }
             }
         }
         catch (OperationCanceledException) { }
+        catch (InvalidOperationException) { } // queue completed while blocked in TryTake
 
         System.Diagnostics.Debug.WriteLine("[Decoder] Decode thread stopped.");
     }

@@ -571,7 +571,13 @@ public sealed class AirPlaySession : IAsyncDisposable
                 });
             }
         }
-        catch (Exception ex) when (ex is SocketException or ObjectDisposedException) { }
+        // The listener throws when it's stopped during teardown. AcceptTcpClientAsync
+        // can surface this as SocketException, ObjectDisposedException, or (after Stop)
+        // InvalidOperationException — none should escape this fire-and-forget task.
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[Setup] event channel closed: {ex.Message}");
+        }
     }
 
     /// <summary>Opens a UDP socket for the timing/NTP channel (port is reported to iOS; NTP not yet implemented).</summary>

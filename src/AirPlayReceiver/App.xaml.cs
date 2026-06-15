@@ -17,9 +17,43 @@ public partial class App : Application
     {
         this.InitializeComponent();
 
+        // Catch and log any unhandled exception so a crash leaves a trace even after
+        // the debugger detaches (the process otherwise just exits with 0xffffffff).
+        WireCrashLogging();
+
         // Point FFmpeg.AutoGen at our bundled DLLs before any codec call.
         ffmpeg.RootPath = System.IO.Path.Combine(
             System.AppContext.BaseDirectory, "native", "x64");
+    }
+
+    private void WireCrashLogging()
+    {
+        // UI-thread exceptions (WinUI): log and mark handled so a recoverable error
+        // (e.g. a render hiccup when a stream tears down) doesn't kill the process.
+        this.UnhandledException += (_, e) =>
+        {
+            LogCrash("UI", e.Exception);
+            e.Handled = true;
+        };
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            LogCrash("AppDomain", e.ExceptionObject as Exception);
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            LogCrash("Task", e.Exception);
+            e.SetObserved();
+        };
+    }
+
+    private static void LogCrash(string source, Exception? ex)
+    {
+        string msg = $"[Crash:{source}] {DateTime.Now:O}\n{ex}\n";
+        System.Diagnostics.Debug.WriteLine(msg);
+        try
+        {
+            System.IO.File.AppendAllText(
+                System.IO.Path.Combine(System.AppContext.BaseDirectory, "airplay-crash.log"), msg);
+        }
+        catch { /* best-effort */ }
     }
 
     protected override async void OnLaunched(LaunchActivatedEventArgs args)
