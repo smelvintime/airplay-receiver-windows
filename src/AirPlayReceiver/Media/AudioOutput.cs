@@ -61,8 +61,8 @@ public sealed class AudioOutput : IDisposable
         var format = WaveFormat.CreateIeeeFloatWaveFormat(DeviceSampleRate, 2);
         _buffer = new BufferedWaveProvider(format)
         {
-            BufferDuration          = TimeSpan.FromMilliseconds(600),
-            DiscardOnBufferOverflow = true,
+            BufferDuration          = TimeSpan.FromMilliseconds(1000),
+            DiscardOnBufferOverflow = false,  // we guard in Enqueue — never let NAudio do a partial write
         };
 
         _device = new WasapiOut(AudioClientShareMode.Shared, 50);
@@ -77,9 +77,16 @@ public sealed class AudioOutput : IDisposable
     {
         if (_buffer is null) return;
 
-        // Detect overflow before AddSamples silently drops (DiscardOnBufferOverflow).
+        // Drop the entire frame if it won't fit rather than letting NAudio do a
+        // partial write. A truncated PCM frame plays back as a burst of garbage
+        // samples — audible as a loud click/pop. Dropping a whole frame produces
+        // at most a brief silence, which is much less objectionable.
         int free = _buffer.BufferLength - _buffer.BufferedBytes;
-        if (pcm.Length > free) DiscardedBytes += pcm.Length - free;
+        if (pcm.Length > free)
+        {
+            DiscardedBytes += pcm.Length;
+            return;
+        }
 
         _buffer.AddSamples(pcm, 0, pcm.Length);
 
