@@ -26,14 +26,15 @@ public sealed unsafe class AudioResampler : IDisposable
         AVChannelLayout stereo = default;
         ffmpeg.av_channel_layout_default(&stereo, 2);
 
-        _swr = null;
+        SwrContext* swr = null;
         int ret = ffmpeg.swr_alloc_set_opts2(
-            &_swr,
+            &swr,
             &stereo, AVSampleFormat.AV_SAMPLE_FMT_FLT, _outRate,
             &stereo, AVSampleFormat.AV_SAMPLE_FMT_FLT, _inRate,
             0, null);
-        if (ret < 0 || _swr == null)
+        if (ret < 0 || swr == null)
             throw new InvalidOperationException($"swr_alloc_set_opts2 failed: {ret}");
+        _swr = swr;
 
         ret = ffmpeg.swr_init(_swr);
         if (ret < 0)
