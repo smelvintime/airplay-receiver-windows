@@ -29,6 +29,15 @@ public sealed class AudioOutput : IDisposable
     /// <summary>Total bytes dropped due to buffer overflow since start (diagnostic).</summary>
     public long DiscardedBytes { get; private set; }
 
+    private float _volume = 1f;
+
+    /// <summary>Sets the output gain (0.0–1.0). Applied to the WASAPI session.</summary>
+    public void SetVolume(float linear)
+    {
+        _volume = Math.Clamp(linear, 0f, 1f);
+        if (_device is not null) _device.Volume = _volume;
+    }
+
     public void Start()
     {
         var format = WaveFormat.CreateIeeeFloatWaveFormat(44100, 2);
@@ -40,6 +49,7 @@ public sealed class AudioOutput : IDisposable
 
         _device = new WasapiOut(AudioClientShareMode.Shared, 50);
         _device.Init(_buffer);
+        _device.Volume = _volume;   // honour any volume set before Start()
         // Don't call Play() yet — we gate on PreFillBytes in Enqueue().
         System.Diagnostics.Debug.WriteLine("[Audio] WASAPI output started (44100/2 float, 50ms latency)");
     }
