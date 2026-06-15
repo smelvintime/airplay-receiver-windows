@@ -35,10 +35,18 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
     private ushort _lastSeq;
     private long _seqGaps;
 
+    // ── Redundancy de-duplication ─────────────────────────────────────────────
+    private uint _lastDecodedTs;
+    private bool _haveDecoded;
+    private long _decodedFrames;
+
     public int DataPort    { get; private set; }
     public int ControlPort { get; private set; }
 
     public void Configure(AudioStreamCrypto? crypto) => _crypto = crypto;
+
+    /// <summary>Sets playback gain (0.0–1.0) from the AirPlay volume parameter.</summary>
+    public void SetVolume(float linear) => _output?.SetVolume(linear);
 
     public void Start()
     {
@@ -110,14 +118,27 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
                 _lastSeq = seq;
                 _lastTs  = ts;
 
-                _decoder?.Decode(payload);
+                // AirPlay sends each audio frame as ~3 redundant RTP copies that share
+                // one timestamp (loss resilience). Decode each frame exactly once — only
+                // when the timestamp advances past the last frame we played. Without this
+                // we decoded all 3 copies, producing 3× real-time audio that overflowed
+                // the buffer and sounded robotic/choppy. The signed delta is wrap-safe.
+                bool isNewFrame = !_haveDecoded || (int)(ts - _lastDecodedTs) > 0;
+                if (isNewFrame)
+                {
+                    _haveDecoded   = true;
+                    _lastDecodedTs = ts;
+                    _decoder?.Decode(payload);
+                    _decodedFrames++;
+                }
+
                 if (++_count % 500 == 0)
                 {
                     double wall  = _sw.Elapsed.TotalSeconds;
                     double tsSec = (uint)(_lastTs - _firstTs) / 44100.0;  // stream time elapsed per RTP clock
                     double ratio = wall > 0 ? tsSec / wall : 0;            // ~1.0 = real-time; >1 fast; <1 slow
                     System.Diagnostics.Debug.WriteLine(
-                        $"[Audio] {_count} pkts | wall={wall:F1}s streamTs={tsSec:F1}s ratio={ratio:F2} " +
+                        $"[Audio] {_count} pkts ({_decodedFrames} decoded) | wall={wall:F1}s streamTs={tsSec:F1}s ratio={ratio:F2} " +
                         $"payload={payloadLen}B buffered={_output?.BufferedMs ?? -1}ms " +
                         $"discarded={_output?.DiscardedBytes ?? -1}B seqGaps={_seqGaps}");
                 }

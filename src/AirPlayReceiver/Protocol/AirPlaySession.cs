@@ -607,8 +607,30 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandleSetParameter(RtspMessage msg)
     {
-        // SET_PARAMETER carries parameter updates (e.g. volume).
-        // We parse but don't act on them in this skeleton.
+        // SET_PARAMETER carries text/parameters updates. The one we act on is
+        // "volume: <dB>", sent when the phone's volume changes. AirPlay volume is
+        // in decibels: 0.0 = max, down to about -30 = quiet, and -144 = muted.
+        if (msg.Body is { Length: > 0 } body)
+        {
+            string text = System.Text.Encoding.ASCII.GetString(body);
+            foreach (string line in text.Split('\n'))
+            {
+                int colon = line.IndexOf(':');
+                if (colon < 0) continue;
+
+                string key = line[..colon].Trim();
+                string val = line[(colon + 1)..].Trim();
+                if (!key.Equals("volume", StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (float.TryParse(val, System.Globalization.NumberStyles.Float,
+                                   System.Globalization.CultureInfo.InvariantCulture, out float db))
+                {
+                    float gain = db <= -144f ? 0f : Math.Clamp((float)Math.Pow(10.0, db / 20.0), 0f, 1f);
+                    _audio?.SetVolume(gain);
+                    System.Diagnostics.Debug.WriteLine($"[Audio] volume {db:F1} dB → gain {gain:F3}");
+                }
+            }
+        }
         return BuildOk(msg.CSeq);
     }
 
