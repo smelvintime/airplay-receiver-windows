@@ -5,23 +5,25 @@ using System;
 namespace AirPlayReceiver.Media;
 
 /// <summary>
-/// Plays interleaved 32-bit float PCM (44.1 kHz stereo) to the default Windows
-/// output device via WASAPI (NAudio).
+/// Plays interleaved 32-bit float PCM to the default Windows output device via
+/// WASAPI (NAudio). Configures itself at the device's native mix sample rate so
+/// that Windows does not perform additional resampling (which introduces
+/// high-frequency aliasing artifacts audible during screen mirroring).
 ///
 /// Two latency knobs:
 ///  - WASAPI shared-mode latency: 50 ms (down from NAudio's 200 ms default).
 ///  - Pre-fill gate: playback does not start until 100 ms of PCM is buffered,
-///    preventing the underrun-induced "robotic" sound that occurs when WASAPI
-///    starts draining an almost-empty buffer on the first few frames.
+///    preventing the underrun-induced "robotic" sound on the first few frames.
 /// </summary>
 public sealed class AudioOutput : IDisposable
 {
-    // 44100 samples/s × 2 ch × 4 bytes/sample × 0.1 s = 35 280 bytes ≈ 100 ms
-    private const int PreFillBytes = 44100 * 2 * sizeof(float) / 10;
-
     private WasapiOut?            _device;
     private BufferedWaveProvider? _buffer;
     private bool _playing;
+    private int  _preFillBytes;
+
+    /// <summary>Sample rate of the WASAPI device mix format (set during Start).</summary>
+    public int DeviceSampleRate { get; private set; } = 48000;
 
     /// <summary>Current jitter-buffer fill level in milliseconds (diagnostic).</summary>
     public int BufferedMs => _buffer is null ? 0 : (int)_buffer.BufferedDuration.TotalMilliseconds;
@@ -40,18 +42,34 @@ public sealed class AudioOutput : IDisposable
 
     public void Start()
     {
-        var format = WaveFormat.CreateIeeeFloatWaveFormat(44100, 2);
+        // Query the device's native mix format so we can feed it PCM at that rate,
+        // avoiding Windows' low-quality built-in resampler (source of HF artifacts).
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            DeviceSampleRate = device.AudioClient.MixFormat.SampleRate;
+        }
+        catch
+        {
+            DeviceSampleRate = 48000;
+        }
+
+        // 100 ms pre-fill at device rate: rate × 2 ch × 4 bytes/sample × 0.1 s
+        _preFillBytes = DeviceSampleRate * 2 * sizeof(float) / 10;
+
+        var format = WaveFormat.CreateIeeeFloatWaveFormat(DeviceSampleRate, 2);
         _buffer = new BufferedWaveProvider(format)
         {
-            BufferDuration          = TimeSpan.FromMilliseconds(300),
+            BufferDuration          = TimeSpan.FromMilliseconds(600),
             DiscardOnBufferOverflow = true,
         };
 
         _device = new WasapiOut(AudioClientShareMode.Shared, 50);
         _device.Init(_buffer);
         _device.Volume = _volume;   // honour any volume set before Start()
-        // Don't call Play() yet — we gate on PreFillBytes in Enqueue().
-        System.Diagnostics.Debug.WriteLine("[Audio] WASAPI output started (44100/2 float, 50ms latency)");
+        // Don't call Play() yet — we gate on _preFillBytes in Enqueue().
+        System.Diagnostics.Debug.WriteLine($"[Audio] WASAPI output started ({DeviceSampleRate}/2 float, 50ms latency)");
     }
 
     /// <summary>Queues a decoded PCM frame for playback. Thread-safe.</summary>
@@ -65,7 +83,7 @@ public sealed class AudioOutput : IDisposable
 
         _buffer.AddSamples(pcm, 0, pcm.Length);
 
-        if (!_playing && _buffer.BufferedBytes >= PreFillBytes)
+        if (!_playing && _buffer.BufferedBytes >= _preFillBytes)
         {
             _playing = true;
             _device?.Play();

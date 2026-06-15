@@ -25,6 +25,7 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
     private AudioStreamCrypto? _crypto;
     private AudioDecoder?      _decoder;
     private AudioOutput?       _output;
+    private AudioResampler?    _resampler;
 
     private long _count;
     private bool _firstLogged;
@@ -59,9 +60,23 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
         // failure still leaves the ports open (and mirroring video unaffected).
         try
         {
-            _output  = new AudioOutput();
+            _output = new AudioOutput();
             _output.Start();
-            _decoder = new AudioDecoder(pcm => _output!.Enqueue(pcm));
+
+            // If the WASAPI device runs at a different rate than the 44.1 kHz AirPlay
+            // stream, resample here using FFmpeg swresample (high quality) rather than
+            // letting Windows' built-in resampler handle it (low quality, causes HF noise).
+            if (_output.DeviceSampleRate != 44100)
+            {
+                _resampler = new AudioResampler(44100, _output.DeviceSampleRate);
+                _resampler.Initialize();
+            }
+
+            _decoder = new AudioDecoder(pcm =>
+            {
+                byte[] toPlay = _resampler is not null ? _resampler.Resample(pcm) : pcm;
+                if (toPlay.Length > 0) _output.Enqueue(toPlay);
+            });
             _decoder.Initialize();
         }
         catch (Exception ex)
@@ -163,6 +178,7 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
         _cts?.Cancel();
         _data?.Dispose();
         _control?.Dispose();
+        _resampler?.Dispose();
         _output?.Dispose();
         _decoder?.Dispose();
         await Task.CompletedTask;
