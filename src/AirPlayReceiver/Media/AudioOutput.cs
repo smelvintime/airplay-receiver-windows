@@ -23,6 +23,12 @@ public sealed class AudioOutput : IDisposable
     private BufferedWaveProvider? _buffer;
     private bool _playing;
 
+    /// <summary>Current jitter-buffer fill level in milliseconds (diagnostic).</summary>
+    public int BufferedMs => _buffer is null ? 0 : (int)_buffer.BufferedDuration.TotalMilliseconds;
+
+    /// <summary>Total bytes dropped due to buffer overflow since start (diagnostic).</summary>
+    public long DiscardedBytes { get; private set; }
+
     public void Start()
     {
         var format = WaveFormat.CreateIeeeFloatWaveFormat(44100, 2);
@@ -42,6 +48,11 @@ public sealed class AudioOutput : IDisposable
     public void Enqueue(byte[] pcm)
     {
         if (_buffer is null) return;
+
+        // Detect overflow before AddSamples silently drops (DiscardOnBufferOverflow).
+        int free = _buffer.BufferLength - _buffer.BufferedBytes;
+        if (pcm.Length > free) DiscardedBytes += pcm.Length - free;
+
         _buffer.AddSamples(pcm, 0, pcm.Length);
 
         if (!_playing && _buffer.BufferedBytes >= PreFillBytes)
