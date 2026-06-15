@@ -29,6 +29,12 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
     private long _count;
     private bool _firstLogged;
 
+    // ── Diagnostics: measure real stream rate vs wall-clock ───────────────────
+    private readonly System.Diagnostics.Stopwatch _sw = new();
+    private uint _firstTs, _lastTs;
+    private ushort _lastSeq;
+    private long _seqGaps;
+
     public int DataPort    { get; private set; }
     public int ControlPort { get; private set; }
 
@@ -78,6 +84,10 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
                 if (p.Length == 16 && p[12] == 0x00 && p[13] == 0x68 && p[14] == 0x34 && p[15] == 0x00)
                     continue; // "no data" keepalive
 
+                // RTP header: seq = bytes 2-3, timestamp = bytes 4-7 (big-endian).
+                ushort seq = (ushort)((p[2] << 8) | p[3]);
+                uint   ts  = (uint)((p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7]);
+
                 int payloadLen = p.Length - 12;            // strip 12-byte RTP header
                 byte[] payload = new byte[payloadLen];
                 Buffer.BlockCopy(p, 12, payload, 0, payloadLen);
@@ -87,15 +97,30 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
                 if (!_firstLogged)
                 {
                     _firstLogged = true;
+                    _firstTs = ts;
+                    _lastSeq = (ushort)(seq - 1);
+                    _sw.Start();
                     bool eld = payload[0] is 0x8c or 0x8d or 0x8e or 0x80 or 0x81 or 0x82;
                     System.Diagnostics.Debug.WriteLine(
                         $"[Audio] first packet {payloadLen}B, first byte 0x{payload[0]:X2} " +
                         $"({(eld ? "valid AAC-ELD — decryption OK" : "NOT AAC-ELD — key/iv mismatch?")})");
                 }
 
+                if (seq != (ushort)(_lastSeq + 1)) _seqGaps++;   // reorder/loss
+                _lastSeq = seq;
+                _lastTs  = ts;
+
                 _decoder?.Decode(payload);
                 if (++_count % 500 == 0)
-                    System.Diagnostics.Debug.WriteLine($"[Audio] {_count} packets");
+                {
+                    double wall  = _sw.Elapsed.TotalSeconds;
+                    double tsSec = (uint)(_lastTs - _firstTs) / 44100.0;  // stream time elapsed per RTP clock
+                    double ratio = wall > 0 ? tsSec / wall : 0;            // ~1.0 = real-time; >1 fast; <1 slow
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Audio] {_count} pkts | wall={wall:F1}s streamTs={tsSec:F1}s ratio={ratio:F2} " +
+                        $"payload={payloadLen}B buffered={_output?.BufferedMs ?? -1}ms " +
+                        $"discarded={_output?.DiscardedBytes ?? -1}B seqGaps={_seqGaps}");
+                }
             }
         }
         catch (Exception ex) when (ex is OperationCanceledException or SocketException or ObjectDisposedException) { }
