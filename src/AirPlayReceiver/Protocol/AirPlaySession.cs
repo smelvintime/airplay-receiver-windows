@@ -48,7 +48,8 @@ public sealed class AirPlaySession : IAsyncDisposable
     private MirrorStreamReceiver? _mirror;        // TCP video stream
     private AudioStreamReceiver?  _audio;         // UDP/RTP AAC-ELD audio (type 96)
     private TcpListener?          _eventListener; // event channel (accept + ignore)
-    private UdpClient?            _timing;        // timing/NTP channel (minimal)
+    private UdpClient?            _timing;        // timing/NTP channel
+    private CancellationTokenSource? _timingCts; // cancels the timing receive loop
     private byte[]?               _streamEkey;    // FairPlay-encrypted stream key (from SETUP)
     private byte[]?               _streamEiv;     // stream AES IV (from SETUP)
     private byte[]?               _streamAesKey;  // FairPlay-decrypted 16-byte AES key
@@ -580,13 +581,74 @@ public sealed class AirPlaySession : IAsyncDisposable
         }
     }
 
-    /// <summary>Opens a UDP socket for the timing/NTP channel (port is reported to iOS; NTP not yet implemented).</summary>
+    /// <summary>Opens the UDP timing channel, reports its port to iOS, and starts the NTP response loop.</summary>
     private int OpenTimingChannel()
     {
-        _timing = new UdpClient(0);
+        _timing    = new UdpClient(0);
+        _timingCts = new CancellationTokenSource();
+        _ = RunTimingChannelAsync(_timingCts.Token);
         int port = ((IPEndPoint)_timing.Client.LocalEndPoint!).Port;
         System.Diagnostics.Debug.WriteLine($"[Setup] timing channel on UDP {port}");
         return port;
+    }
+
+    /// <summary>
+    /// Responds to AirPlay NTP timing requests (packet type 0xD2) with timing
+    /// responses (0xD3). Without these replies the sender periodically resyncs
+    /// its audio clock, causing brief pauses in audio delivery (heard as pops).
+    /// </summary>
+    private async Task RunTimingChannelAsync(CancellationToken ct)
+    {
+        if (_timing is null) return;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                UdpReceiveResult req = await _timing.ReceiveAsync(ct);
+                byte[] p = req.Buffer;
+                if (p.Length < 32 || p[1] != 0xD2) continue;  // not a timing request
+
+                ulong recvTime = NtpNow();
+
+                // Echo reference time (bytes 8–15) and fill in received + send times.
+                byte[] resp = new byte[32];
+                resp[0] = 0x80;
+                resp[1] = 0xD3;   // timing response
+                resp[2] = p[2];   // sequence number (big-endian echo)
+                resp[3] = p[3];
+                Buffer.BlockCopy(p, 8, resp, 8, 8);   // reference time
+                WriteUInt64BE(resp, 16, recvTime);      // received time
+                WriteUInt64BE(resp, 24, NtpNow());      // send time
+
+                await _timing.SendAsync(resp, 32, req.RemoteEndPoint);
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or SocketException or ObjectDisposedException) { }
+        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[Timing] error: {ex.Message}"); }
+    }
+
+    // .NET ticks for the NTP epoch (1900-01-01 00:00:00 UTC).
+    // = .NET ticks for Unix epoch (621355968000000000) − 70 years in ticks (22089888000000000)
+    private const long NtpEpochTicks = 599266080000000000L;
+
+    private static ulong NtpNow()
+    {
+        long ticks = DateTime.UtcNow.Ticks - NtpEpochTicks;
+        ulong secs = (ulong)(ticks / TimeSpan.TicksPerSecond);
+        ulong frac = (ulong)((ticks % TimeSpan.TicksPerSecond) * 0x100000000UL / TimeSpan.TicksPerSecond);
+        return (secs << 32) | frac;
+    }
+
+    private static void WriteUInt64BE(byte[] buf, int offset, ulong v)
+    {
+        buf[offset]     = (byte)(v >> 56);
+        buf[offset + 1] = (byte)(v >> 48);
+        buf[offset + 2] = (byte)(v >> 40);
+        buf[offset + 3] = (byte)(v >> 32);
+        buf[offset + 4] = (byte)(v >> 24);
+        buf[offset + 5] = (byte)(v >> 16);
+        buf[offset + 6] = (byte)(v >> 8);
+        buf[offset + 7] = (byte)v;
     }
 
     private byte[] HandleRecord(RtspMessage msg)
@@ -825,6 +887,8 @@ public sealed class AirPlaySession : IAsyncDisposable
         }
         _eventListener?.Stop();
         _eventListener = null;
+        _timingCts?.Cancel();
+        _timingCts = null;
         _timing?.Dispose();
         _timing = null;
     }

@@ -23,14 +23,15 @@ public sealed unsafe class AudioResampler : IDisposable
 
     public void Initialize()
     {
-        AVChannelLayout stereo = default;
-        ffmpeg.av_channel_layout_default(&stereo, 2);
+        AVChannelLayout inLayout = default, outLayout = default;
+        ffmpeg.av_channel_layout_default(&inLayout,  2);
+        ffmpeg.av_channel_layout_default(&outLayout, 2);
 
         SwrContext* swr = null;
         int ret = ffmpeg.swr_alloc_set_opts2(
             &swr,
-            &stereo, AVSampleFormat.AV_SAMPLE_FMT_FLT, _outRate,
-            &stereo, AVSampleFormat.AV_SAMPLE_FMT_FLT, _inRate,
+            &outLayout, AVSampleFormat.AV_SAMPLE_FMT_FLT, _outRate,
+            &inLayout,  AVSampleFormat.AV_SAMPLE_FMT_FLT, _inRate,
             0, null);
         if (ret < 0 || swr == null)
             throw new InvalidOperationException($"swr_alloc_set_opts2 failed: {ret}");
