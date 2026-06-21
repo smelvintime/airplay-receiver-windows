@@ -635,7 +635,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     {
         long ticks = DateTime.UtcNow.Ticks - NtpEpochTicks;
         ulong secs = (ulong)(ticks / TimeSpan.TicksPerSecond);
-        ulong frac = (ulong)((ticks % TimeSpan.TicksPerSecond) * 0x100000000UL / TimeSpan.TicksPerSecond);
+        ulong frac = (ulong)(ticks % TimeSpan.TicksPerSecond) * 0x100000000UL / (ulong)TimeSpan.TicksPerSecond;
         return (secs << 32) | frac;
     }
 
