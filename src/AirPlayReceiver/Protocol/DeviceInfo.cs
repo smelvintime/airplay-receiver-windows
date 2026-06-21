@@ -28,10 +28,14 @@ public sealed class DeviceInfo
     /// <summary>Persistent device GUID string.</summary>
     public string Pi { get; init; } = "";
 
-    // Mirror display geometry advertised to iOS. A larger box lets iOS encode at
-    // higher resolution (it fits the phone's screen inside this, preserving aspect),
-    // which improves sharpness in both orientations.
-    public int DisplayWidth  { get; init; } = 2560;
-    public int DisplayHeight { get; init; } = 1440;
+    // Mirror display geometry advertised to iOS. This is the canvas iOS composes
+    // the mirror stream into, so its aspect ratio drives orientation: a portrait
+    // (tall) box keeps a portrait phone upright even when an app (e.g. Tinder)
+    // hands a video to AirPlay's full-display video mode — otherwise iOS composes
+    // the portrait screen into a landscape frame and it ends up sideways/stretched.
+    // Phone-shaped dimensions (≈19.5:9) make the common case — mirroring a phone —
+    // look right; genuinely landscape content is letterboxed instead.
+    public int DisplayWidth  { get; init; } = 1170;
+    public int DisplayHeight { get; init; } = 2532;
     public int MaxFps        { get; init; } = 60;
 }
