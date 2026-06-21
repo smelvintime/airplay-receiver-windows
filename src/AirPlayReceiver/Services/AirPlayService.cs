@@ -73,6 +73,7 @@ public sealed class AirPlayService : IAsyncDisposable
         _videoPlayer = new AirPlayVideoPlayer(
             onFrame:      framePtr => _presenter!.PresentFrame(framePtr),
             onDimensions: (w, h)   => _window?.UpdateStreamDimensions(w, h),
+            onRotation:   deg      => _presenter?.SetRotation(deg),
             onActive:     active   =>
             {
                 if (active) _window?.OnSessionStarted();
@@ -142,7 +143,9 @@ public sealed class AirPlayService : IAsyncDisposable
         var pairing = new PairingHandler(_identity!);
         var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!);
 
-        session.StreamStarted += () => { _window?.OnSessionStarted(); _presenter?.SetActive(true); };
+        // Mirroring frames arrive already upright, so clear any rotation left over
+        // from a previous AirPlay Video session before this stream renders.
+        session.StreamStarted += () => { _presenter?.SetRotation(0); _window?.OnSessionStarted(); _presenter?.SetActive(true); };
         session.StreamStopped += () => { _window?.OnSessionEnded();   _presenter?.SetActive(false); };
 
         return session;

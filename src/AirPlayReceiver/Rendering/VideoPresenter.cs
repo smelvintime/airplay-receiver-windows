@@ -41,6 +41,17 @@ public sealed unsafe class VideoPresenter : IDisposable
     private ShaderResourceView?         _chromaView;
     private Texture2D?                  _yTex;       // NV12 luma  (R8)
     private Texture2D?                  _uvTex;      // NV12 chroma (R8G8, half res)
+    private SharpDX.Direct3D11.Buffer?  _rotBuffer;  // PS constant buffer: UV remap for display rotation
+
+    // Display rotation applied in the pixel shader (sampling-coordinate remap).
+    // Identity by default; only the AirPlay Video path sets a non-zero rotation
+    // for portrait phone clips whose pixels are stored landscape + a rotation flag.
+    private RotationConstants _rotConstants = new()
+    {
+        Map0 = new RawVector4(1, 0, 0, 0),   // source_u = u
+        Map1 = new RawVector4(0, 1, 0, 0),   // source_v = v
+    };
+    private bool _rotDirty = true;           // upload the constants on the next frame
 
     // Serialises immediate-context use between the decode thread (PresentFrame)
     // and the UI thread (Resize).
@@ -110,6 +121,17 @@ public sealed unsafe class VideoPresenter : IDisposable
         // ── Shaders ───────────────────────────────────────────────────────────
         CompileShaders();
 
+        // ── Rotation constant buffer (PS slot b0) ─────────────────────────────
+        // Two float4 rows = 32 bytes. Default identity remap (no rotation).
+        _rotBuffer = new SharpDX.Direct3D11.Buffer(_device, new BufferDescription
+        {
+            SizeInBytes    = 32,
+            Usage          = ResourceUsage.Default,
+            BindFlags      = BindFlags.ConstantBuffer,
+            CpuAccessFlags = CpuAccessFlags.None,
+            OptionFlags    = ResourceOptionFlags.None,
+        });
+
         // ── Sampler ───────────────────────────────────────────────────────────
         _sampler = new SamplerState(_device, new SamplerStateDescription
         {
@@ -157,6 +179,13 @@ public sealed unsafe class VideoPresenter : IDisposable
 
             EnsureNv12Textures(w, h);
 
+            // Push a changed display-rotation remap to the GPU before drawing.
+            if (_rotDirty)
+            {
+                _context.UpdateSubresource(ref _rotConstants, _rotBuffer!);
+                _rotDirty = false;
+            }
+
             // Upload the planes (source row pitch = FFmpeg linesize, which may be padded).
             _context.UpdateSubresource(new DataBox(yPtr,  yPitch,  yPitch  * h),       _yTex!,  0);
             _context.UpdateSubresource(new DataBox(uvPtr, uvPitch, uvPitch * (h / 2)), _uvTex!, 0);
@@ -172,6 +201,7 @@ public sealed unsafe class VideoPresenter : IDisposable
             _context.VertexShader.Set(_vs);
             _context.PixelShader.Set(_ps);
             _context.PixelShader.SetSampler(0, _sampler);
+            _context.PixelShader.SetConstantBuffer(0, _rotBuffer!);
             _context.PixelShader.SetShaderResource(0, _lumaView);
             _context.PixelShader.SetShaderResource(1, _chromaView);
 
@@ -205,6 +235,40 @@ public sealed unsafe class VideoPresenter : IDisposable
                 _swapChain.Present(1, PresentFlags.None);
             }
         }
+    }
+
+    /// <summary>
+    /// Sets the display rotation (degrees, clockwise — must be a multiple of 90)
+    /// applied when sampling the video. AirPlay Video (URL playback) uses this for
+    /// portrait phone clips, which are encoded with landscape pixel dimensions plus
+    /// a rotation flag in the container; without it they render sideways/stretched.
+    /// The mirror path leaves this at 0.
+    /// </summary>
+    public void SetRotation(int degrees)
+    {
+        int rot = ((degrees % 360) + 360) % 360;
+        rot = (rot + 45) / 90 * 90 % 360;   // snap to the nearest quarter turn
+
+        // Sampling-coordinate remap (dest uv → source uv) for a clockwise image
+        // rotation. texY/texUV are sampled at source = (dot(Map0.xy, uv) + Map0.z,
+        // dot(Map1.xy, uv) + Map1.z), so each row is (a, b, offset, _).
+        RawVector4 m0, m1;
+        switch (rot)
+        {
+            case 90:  m0 = new RawVector4( 0, 1, 0, 0); m1 = new RawVector4(-1,  0, 1, 0); break; // src = ( v, 1-u)
+            case 180: m0 = new RawVector4(-1, 0, 1, 0); m1 = new RawVector4( 0, -1, 1, 0); break; // src = (1-u,1-v)
+            case 270: m0 = new RawVector4( 0,-1, 1, 0); m1 = new RawVector4( 1,  0, 0, 0); break; // src = (1-v,  u)
+            default:  m0 = new RawVector4( 1, 0, 0, 0); m1 = new RawVector4( 0,  1, 0, 0); break; // src = ( u,  v)
+        }
+
+        lock (_renderLock)
+        {
+            _rotConstants.Map0 = m0;
+            _rotConstants.Map1 = m1;
+            _rotDirty = true;
+        }
+
+        System.Diagnostics.Debug.WriteLine($"[Renderer] display rotation = {rot}°");
     }
 
     // ── Resize ────────────────────────────────────────────────────────────────
@@ -315,12 +379,22 @@ public sealed unsafe class VideoPresenter : IDisposable
             Texture2D<float2> texUV : register(t1);
             SamplerState      samp  : register(s0);
 
+            // Display-rotation UV remap: source = (dot(uMap.xy, uv) + uMap.z,
+            //                                      dot(vMap.xy, uv) + vMap.z)
+            cbuffer Rotation : register(b0)
+            {
+                float4 uMap;
+                float4 vMap;
+            };
+
             struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
             float4 main(PS_IN i) : SV_TARGET
             {
-                float  y  = texY.Sample(samp, i.uv).r;
-                float2 uv = texUV.Sample(samp, i.uv).rg;
+                float2 src = float2(dot(uMap.xy, i.uv) + uMap.z,
+                                    dot(vMap.xy, i.uv) + vMap.z);
+                float  y  = texY.Sample(samp, src).r;
+                float2 uv = texUV.Sample(samp, src).rg;
 
                 // BT.709 limited range: Y in [16/255, 235/255], UV in [16/255, 240/255]
                 y  = (y  - 16.0/255.0) / (219.0/255.0);
@@ -350,6 +424,7 @@ public sealed unsafe class VideoPresenter : IDisposable
         _chromaView?.Dispose();
         _yTex?.Dispose();
         _uvTex?.Dispose();
+        _rotBuffer?.Dispose();
         _sampler.Dispose();
         _ps.Dispose();
         _vs.Dispose();
@@ -371,4 +446,13 @@ public sealed unsafe class VideoPresenter : IDisposable
     // Unmanaged COM pointer type (opaque — only used for SRV creation)
     [StructLayout(LayoutKind.Sequential)]
     private struct ID3D11Texture2D { }
+
+    // PS constant buffer layout (b0): two float4 rows that remap the sampling
+    // coordinates to apply the stream's display rotation.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RotationConstants
+    {
+        public RawVector4 Map0;   // source_u = dot(Map0.xy, uv) + Map0.z
+        public RawVector4 Map1;   // source_v = dot(Map1.xy, uv) + Map1.z
+    }
 }

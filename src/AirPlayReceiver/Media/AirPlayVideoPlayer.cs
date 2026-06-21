@@ -31,6 +31,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
     private readonly Action<IntPtr>   _onFrame;       // (AVFrame* as IntPtr) NV12 frame
     private readonly Action<int, int> _onDimensions;  // (width, height) when it changes
     private readonly Action<bool>     _onActive;      // true on play, false on stop
+    private readonly Action<int>      _onRotation;    // display rotation in degrees (0/90/180/270)
 
     // ── Public transport state (read by /playback-info and /scrub) ─────────────
 
@@ -60,11 +61,13 @@ public sealed class AirPlayVideoPlayer : IDisposable
     public AirPlayVideoPlayer(
         Action<IntPtr>   onFrame,
         Action<int, int> onDimensions,
-        Action<bool>     onActive)
+        Action<bool>     onActive,
+        Action<int>      onRotation)
     {
         _onFrame      = onFrame;
         _onDimensions = onDimensions;
         _onActive     = onActive;
+        _onRotation   = onRotation;
     }
 
     // ── Transport verbs (called from AirPlaySession) ──────────────────────────
@@ -242,8 +245,20 @@ public sealed class AirPlayVideoPlayer : IDisposable
                         ffmpeg.av_frame_get_buffer(nv12, 32);
 
                         nv12W = w; nv12H = h;
-                        _onDimensions(w, h);
-                        Debug.WriteLine($"[Video] stream {w}×{h} fmt={(AVPixelFormat)frame->format} → NV12");
+
+                        // iPhone clips (Tinder profile videos, Photos, …) are encoded
+                        // with landscape pixel dimensions plus a display-matrix rotation
+                        // flag. FFmpeg does NOT auto-rotate via the decode API, so honour
+                        // the flag here: tell the renderer to rotate, and report the
+                        // *displayed* (rotation-applied) dimensions so the UI letterboxes
+                        // to the right aspect instead of stretching to landscape.
+                        int rotation = GetDisplayRotation(frame);
+                        _onRotation(rotation);
+                        if (rotation == 90 || rotation == 270)
+                            _onDimensions(h, w);
+                        else
+                            _onDimensions(w, h);
+                        Debug.WriteLine($"[Video] stream {w}×{h} rot={rotation}° fmt={(AVPixelFormat)frame->format} → NV12");
                     }
 
                     // sws_scale's destination takes the 4-element array structs, while
@@ -306,6 +321,30 @@ public sealed class AirPlayVideoPlayer : IDisposable
 
         ffmpeg.avcodec_flush_buffers(codecCtx);
         lock (_stateLock) _position = target;
+    }
+
+    /// <summary>
+    /// Reads the stream's display-matrix rotation from a decoded frame's side data
+    /// and returns the clockwise angle (0/90/180/270) to apply for upright display.
+    /// Follows FFmpeg's own autorotation convention (angle = -av_display_rotation_get).
+    /// Returns 0 when no rotation metadata is present.
+    /// </summary>
+    private static unsafe int GetDisplayRotation(AVFrame* frame)
+    {
+        AVFrameSideData* sd = ffmpeg.av_frame_get_side_data(
+            frame, AVFrameSideDataType.AV_FRAME_DATA_DISPLAYMATRIX);
+        if (sd == null || sd->data == null) return 0;
+
+        // The display matrix is 9 packed int32 values (a 3x3 affine transform).
+        var matrix = new int_array9();
+        int* m = (int*)sd->data;
+        for (uint k = 0; k < 9; k++) matrix[k] = m[k];
+
+        double angle = ffmpeg.av_display_rotation_get(matrix);
+        if (double.IsNaN(angle)) return 0;
+
+        int rot = ((int)Math.Round(-angle) % 360 + 360) % 360;
+        return (rot + 45) / 90 * 90 % 360;   // snap to the nearest quarter turn
     }
 
     private static unsafe string Err(int code)
