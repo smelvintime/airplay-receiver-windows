@@ -847,12 +847,33 @@ public sealed class AirPlaySession : IAsyncDisposable
 
                 if (prop.Equals("selectedMediaArray", StringComparison.OrdinalIgnoreCase))
                 {
-                    var urls = new List<string>();
-                    CollectUrls(parsed, urls);
-                    if (urls.Count > 0)
+                    var candidates = new List<MediaCandidate>();
+                    CollectUrls(parsed, "", candidates);
+
+                    // The old code took urls[0] from a blind recursive sweep, so a
+                    // thumbnail, poster or ad-tracking pixel — which routinely come
+                    // first — was what FFmpeg tried to open.
+                    MediaCandidate? best = null;
+                    foreach (var c in candidates)
+                        if (c.Score > 0 && (best is null || c.Score > best.Score)) best = c;
+
+                    foreach (var c in candidates)
+                        Log.Info("Video", $"  media candidate {c.KeyPath} score={c.Score} " +
+                                          $"[{(ReferenceEquals(c, best) ? "CHOSEN" : "rejected")}: {c.Reason}] {c.Url}");
+
+                    if (best is not null)
                     {
-                        Log.Info("Video", $"selectedMediaArray URL(s): {string.Join(", ", urls)}");
-                        _videoPlayer.Play(urls[0], 0);
+                        double startSeconds  = FindPlistDouble(parsed, "Start-Position-Seconds");
+                        double startFraction = FindPlistDouble(parsed, "Start-Position");
+                        string? uuid         = FindPlistString(parsed, "uuid");
+                        Log.Info("Video", $"selectedMediaArray → {best.Url} " +
+                                          $"(startSeconds={Inv(startSeconds)} startFraction={Inv(startFraction)} uuid={uuid ?? "(none)"})");
+                        StartVideoPlayback(best.Url, startSeconds, startFraction, uuid, msg);
+                    }
+                    else if (candidates.Count > 0)
+                    {
+                        Log.Warn("Video", $"selectedMediaArray had {candidates.Count} URL(s) but none looked like " +
+                                          "playable media — see the per-candidate reasons above");
                     }
                     else
                     {
@@ -940,21 +961,129 @@ public sealed class AirPlaySession : IAsyncDisposable
         _               => v.ToString() ?? "null",
     };
 
-    private static void CollectUrls(object? node, List<string> urls)
+    // ── selectedMediaArray URL selection ──────────────────────────────────────
+
+    /// <summary>One http(s) string found in a media plist, with why we do (not) trust it.</summary>
+    private sealed record MediaCandidate(string Url, string KeyPath, int Score, string Reason);
+
+    private static readonly string[] PlaylistExtensions = { ".m3u8", ".m3u", ".mpd" };
+    private static readonly string[] MediaExtensions =
+        { ".mp4", ".m4v", ".mov", ".ts", ".mkv", ".webm", ".avi", ".3gp", ".m4a", ".mp3", ".aac" };
+    private static readonly string[] ImageExtensions =
+        { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp", ".svg", ".tif", ".tiff" };
+
+    /// <summary>Keys whose values are decoration, never the thing to play.</summary>
+    private static readonly string[] ArtworkKeyHints =
+        { "artwork", "thumb", "image", "poster", "icon", "preview", "logo", "banner", "chapter" };
+
+    /// <summary>Keys that carry analytics/ad beacons — opening one plays nothing.</summary>
+    private static readonly string[] TrackingKeyHints =
+        { "tracking", "beacon", "impression", "advert", "analytics", "metric", "telemetry" };
+
+    /// <summary>Keys that name the actual media, best match first.</summary>
+    private static readonly string[] MediaKeyHints =
+        { "content-location", "contentlocation", "mediaurl", "media-url", "asseturl", "asset-url",
+          "playbackurl", "streamurl", "playlist", "location", "url", "uri" };
+
+    /// <summary>
+    /// Walks a setProperty plist and scores every http(s) string it finds, so the
+    /// caller can pick the media URL rather than whichever URL happened to come
+    /// first. Scoring is deliberately explicit and logged: when a real device sends
+    /// a shape we guessed wrong, the log says exactly what was rejected and why.
+    /// </summary>
+    private static void CollectUrls(object? node, string path, List<MediaCandidate> found)
     {
         switch (node)
         {
             case Dictionary<string, object?> d:
-                foreach (var v in d.Values) CollectUrls(v, urls);
+                foreach (var (k, v) in d) CollectUrls(v, path.Length == 0 ? k : $"{path}.{k}", found);
                 break;
             case List<object?> list:
-                foreach (var v in list) CollectUrls(v, urls);
+                for (int i = 0; i < list.Count; i++) CollectUrls(list[i], $"{path}[{i}]", found);
                 break;
             case string s when s.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                             || s.StartsWith("https://", StringComparison.OrdinalIgnoreCase):
-                urls.Add(s);
+                found.Add(ScoreMediaUrl(s, path));
                 break;
         }
+    }
+
+    private static MediaCandidate ScoreMediaUrl(string url, string keyPath)
+    {
+        string lowerPath = keyPath.ToLowerInvariant();
+
+        foreach (string hint in ArtworkKeyHints)
+            if (lowerPath.Contains(hint))
+                return new MediaCandidate(url, Describe(keyPath), -100, $"key mentions '{hint}' (artwork)");
+
+        foreach (string hint in TrackingKeyHints)
+            if (lowerPath.Contains(hint))
+                return new MediaCandidate(url, Describe(keyPath), -100, $"key mentions '{hint}' (tracking)");
+
+        // Extension comes from the path only — a query string like "?thumb=1.jpg"
+        // must not disqualify a perfectly good .m3u8.
+        string ext = UrlExtension(url);
+        foreach (string image in ImageExtensions)
+            if (ext == image)
+                return new MediaCandidate(url, Describe(keyPath), -100, $"'{ext}' is an image");
+
+        int    score  = 0;
+        string reason;
+        if (Array.IndexOf(PlaylistExtensions, ext) >= 0) { score += 100; reason = $"'{ext}' playlist"; }
+        else if (Array.IndexOf(MediaExtensions, ext) >= 0) { score += 80; reason = $"'{ext}' media file"; }
+        else if (ext.Length == 0) { score += 10; reason = "no extension (redirect or API URL)"; }
+        else { score += 5; reason = $"unknown extension '{ext}'"; }
+
+        for (int i = 0; i < MediaKeyHints.Length; i++)
+            if (lowerPath.Contains(MediaKeyHints[i]))
+            {
+                // Earlier hints are more specific, so they are worth more.
+                int bonus = 60 - i * 4;
+                score += bonus;
+                reason += $" + key '{MediaKeyHints[i]}' (+{bonus})";
+                break;
+            }
+
+        return new MediaCandidate(url, Describe(keyPath), score, reason);
+    }
+
+    /// <summary>The lowercase file extension of a URL's path, or "" when it has none.</summary>
+    private static string UrlExtension(string url)
+    {
+        int cut = url.IndexOfAny(new[] { '?', '#' });
+        string path = cut < 0 ? url : url[..cut];
+        int slash = path.LastIndexOf('/');
+        int dot   = path.LastIndexOf('.');
+        return dot > slash && dot >= 0 ? path[dot..].ToLowerInvariant() : string.Empty;
+    }
+
+    private static string Describe(string keyPath) => keyPath.Length == 0 ? "(root)" : keyPath;
+
+    /// <summary>First value of <paramref name="key"/> anywhere in the plist, as a double (0 when absent).</summary>
+    private static double FindPlistDouble(object? node, string key)
+        => FindPlistValue(node, key) is { } v ? PlistDouble(v) : 0.0;
+
+    /// <summary>First value of <paramref name="key"/> anywhere in the plist, as a string (null when absent).</summary>
+    private static string? FindPlistString(object? node, string key)
+        => FindPlistValue(node, key) as string;
+
+    private static object? FindPlistValue(object? node, string key)
+    {
+        switch (node)
+        {
+            case Dictionary<string, object?> d:
+                foreach (var (k, v) in d)
+                {
+                    if (k.Equals(key, StringComparison.OrdinalIgnoreCase) && v is not null) return v;
+                    if (FindPlistValue(v, key) is { } nested) return nested;
+                }
+                break;
+            case List<object?> list:
+                foreach (var v in list)
+                    if (FindPlistValue(v, key) is { } nested) return nested;
+                break;
+        }
+        return null;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
