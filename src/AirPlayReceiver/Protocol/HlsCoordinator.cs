@@ -788,18 +788,23 @@ public sealed class HlsCoordinator : IAsyncDisposable
         return FindPlayableString(item);
     }
 
-    private static string? FindPlayableString(object? node) => node switch
+    // Depth-limited like every other walker over a phone-supplied plist: an
+    // unbounded recursion is a StackOverflowException, which .NET cannot catch.
+    // See BinaryPlist.MaxDepth.
+    private static string? FindPlayableString(object? node, int depth = 0) => depth > BinaryPlist.MaxDepth
+        ? null
+        : node switch
     {
         string s when Classify(s) != PlayRoute.Unsupported => s,
-        Dictionary<string, object?> d => FirstPlayable(d.Values),
-        List<object?> l               => FirstPlayable(l),
+        Dictionary<string, object?> d => FirstPlayable(d.Values, depth + 1),
+        List<object?> l               => FirstPlayable(l, depth + 1),
         _                             => null,
     };
 
-    private static string? FirstPlayable(IEnumerable<object?> values)
+    private static string? FirstPlayable(IEnumerable<object?> values, int depth)
     {
         foreach (object? v in values)
-            if (FindPlayableString(v) is { } found) return found;
+            if (FindPlayableString(v, depth) is { } found) return found;
         return null;
     }
 
@@ -817,6 +822,13 @@ public sealed class HlsCoordinator : IAsyncDisposable
     private static void DumpNode(object? node, StringBuilder sb, int indent)
     {
         string pad = new(' ', indent * 2);
+
+        if (indent > BinaryPlist.MaxDepth)
+        {
+            sb.Append(pad).Append("… (nesting past ").Append(BinaryPlist.MaxDepth).Append(" not dumped)\n");
+            return;
+        }
+
         switch (node)
         {
             case Dictionary<string, object?> d:

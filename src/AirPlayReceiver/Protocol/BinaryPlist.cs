@@ -19,6 +19,18 @@ namespace AirPlayReceiver.Protocol;
 /// </summary>
 public static class BinaryPlist
 {
+    /// <summary>
+    /// Container nesting limit, shared by every walker over a parsed plist.
+    ///
+    /// Bodies arrive unauthenticated on port 7000, and a binary plist addresses
+    /// its objects by index — an index may point backwards, so a crafted
+    /// dictionary can contain itself. Unbounded recursion here is a
+    /// StackOverflowException, which .NET cannot catch and which takes the process
+    /// down: a remote unauthenticated crash from one small body. Real AirPlay
+    /// plists nest three or four deep.
+    /// </summary>
+    public const int MaxDepth = 32;
+
     // ── Parsing ───────────────────────────────────────────────────────────────
 
     public static object? Parse(byte[] buffer)
@@ -37,11 +49,14 @@ public static class BinaryPlist
         for (int i = 0; i < numObjects; i++)
             offsets[i] = ReadBE(buffer, (int)(offsetTableOffset + i * offsetSize), offsetSize);
 
-        return ReadObject(buffer, offsets, objRefSize, (int)topObject);
+        return ReadObject(buffer, offsets, objRefSize, (int)topObject, 0);
     }
 
-    private static object? ReadObject(byte[] buf, long[] offsets, int refSize, int index)
+    private static object? ReadObject(byte[] buf, long[] offsets, int refSize, int index, int depth)
     {
+        if (depth > MaxDepth)
+            throw new FormatException($"Binary plist nests deeper than {MaxDepth} (self-referencing object table?)");
+
         int pos = (int)offsets[index];
         byte marker = buf[pos];
         int type = marker >> 4;
@@ -91,7 +106,7 @@ public static class BinaryPlist
                 for (int i = 0; i < count; i++)
                 {
                     int r = (int)ReadBE(buf, p + i * refSize, refSize);
-                    list.Add(ReadObject(buf, offsets, refSize, r));
+                    list.Add(ReadObject(buf, offsets, refSize, r, depth + 1));
                 }
                 return list;
             }
@@ -105,8 +120,8 @@ public static class BinaryPlist
                 {
                     int keyRef = (int)ReadBE(buf, p + i * refSize, refSize);
                     int valRef = (int)ReadBE(buf, p + (count + i) * refSize, refSize);
-                    string key = (string)ReadObject(buf, offsets, refSize, keyRef)!;
-                    dict[key] = ReadObject(buf, offsets, refSize, valRef);
+                    string key = (string)ReadObject(buf, offsets, refSize, keyRef, depth + 1)!;
+                    dict[key] = ReadObject(buf, offsets, refSize, valRef, depth + 1);
                 }
                 return dict;
             }

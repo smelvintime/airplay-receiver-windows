@@ -46,6 +46,15 @@ public static class XmlPlist
 
     private const string Epilogue = "</plist>\n";
 
+    /// <summary>
+    /// Container nesting limit while parsing. Same value and same reason as
+    /// <see cref="BinaryPlist.MaxDepth"/> — an unbounded recursion over a body we
+    /// did not write is a StackOverflowException, which .NET cannot catch — but
+    /// declared here rather than referenced, because this file is deliberately
+    /// free of dependencies so the harnesses can link it on its own.
+    /// </summary>
+    private const int MaxDepth = 32;
+
     // ── Writing ───────────────────────────────────────────────────────────────
 
     /// <summary>Serialises <paramref name="root"/> as a UTF-8 XML plist body (no BOM).</summary>
@@ -172,13 +181,15 @@ public static class XmlPlist
             throw new FormatException("Not an XML plist (missing <plist> root)");
 
         XElement? root = plist.Elements().FirstOrDefault();
-        return root is null ? null : ReadElement(root);
+        return root is null ? null : ReadElement(root, 0);
     }
 
-    private static object? ReadElement(XElement e) => e.Name.LocalName switch
+    private static object? ReadElement(XElement e, int depth) => depth > MaxDepth
+        ? throw new FormatException($"XML plist nests deeper than {MaxDepth}")
+        : e.Name.LocalName switch
     {
-        "dict"    => ReadDict(e),
-        "array"   => ReadArray(e),
+        "dict"    => ReadDict(e, depth),
+        "array"   => ReadArray(e, depth),
         "string"  => e.Value,
         "integer" => long.Parse(e.Value.Trim(), CultureInfo.InvariantCulture),
         "real"    => double.Parse(e.Value.Trim(), CultureInfo.InvariantCulture),
@@ -190,7 +201,7 @@ public static class XmlPlist
         _         => throw new FormatException($"Unsupported XML plist element <{e.Name.LocalName}>"),
     };
 
-    private static Dictionary<string, object?> ReadDict(XElement e)
+    private static Dictionary<string, object?> ReadDict(XElement e, int depth)
     {
         var dict = new Dictionary<string, object?>();
         string? key = null;
@@ -203,18 +214,18 @@ public static class XmlPlist
             else
             {
                 if (key is null) throw new FormatException("<dict> value without a preceding <key>");
-                dict[key] = ReadElement(child);
+                dict[key] = ReadElement(child, depth + 1);
                 key = null;
             }
         }
         return dict;
     }
 
-    private static List<object?> ReadArray(XElement e)
+    private static List<object?> ReadArray(XElement e, int depth)
     {
         var list = new List<object?>();
         foreach (XElement child in e.Elements())
-            list.Add(ReadElement(child));
+            list.Add(ReadElement(child, depth + 1));
         return list;
     }
 

@@ -1253,9 +1253,21 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     // ── Plist diagnostics ──────────────────────────────────────────────────────
 
+    // Every walker below is depth-limited. They run on EVERY /play, /action and
+    // setProperty, over a plist the phone supplied, purely as diagnostics — and an
+    // unbounded recursion is a StackOverflowException, which .NET cannot catch.
+    // BinaryPlist.Parse caps nesting too; this does not lean on that, because a
+    // diagnostic helper is exactly the thing that gets reused somewhere else.
     private static void DumpPlist(object? node, StringBuilder sb, int indent)
     {
         string pad = new(' ', indent * 2);
+
+        if (indent > BinaryPlist.MaxDepth)
+        {
+            sb.AppendLine($"{pad}… (nesting past {BinaryPlist.MaxDepth} not dumped)");
+            return;
+        }
+
         switch (node)
         {
             case Dictionary<string, object?> d:
@@ -1326,15 +1338,17 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// first. Scoring is deliberately explicit and logged: when a real device sends
     /// a shape we guessed wrong, the log says exactly what was rejected and why.
     /// </summary>
-    private static void CollectUrls(object? node, string path, List<MediaCandidate> found)
+    private static void CollectUrls(object? node, string path, List<MediaCandidate> found, int depth = 0)
     {
+        if (depth > BinaryPlist.MaxDepth) return;
+
         switch (node)
         {
             case Dictionary<string, object?> d:
-                foreach (var (k, v) in d) CollectUrls(v, path.Length == 0 ? k : $"{path}.{k}", found);
+                foreach (var (k, v) in d) CollectUrls(v, path.Length == 0 ? k : $"{path}.{k}", found, depth + 1);
                 break;
             case List<object?> list:
-                for (int i = 0; i < list.Count; i++) CollectUrls(list[i], $"{path}[{i}]", found);
+                for (int i = 0; i < list.Count; i++) CollectUrls(list[i], $"{path}[{i}]", found, depth + 1);
                 break;
             case string s when s.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                             || s.StartsWith("https://", StringComparison.OrdinalIgnoreCase):
@@ -1402,20 +1416,22 @@ public sealed class AirPlaySession : IAsyncDisposable
     private static string? FindPlistString(object? node, string key)
         => FindPlistValue(node, key) as string;
 
-    private static object? FindPlistValue(object? node, string key)
+    private static object? FindPlistValue(object? node, string key, int depth = 0)
     {
+        if (depth > BinaryPlist.MaxDepth) return null;
+
         switch (node)
         {
             case Dictionary<string, object?> d:
                 foreach (var (k, v) in d)
                 {
                     if (k.Equals(key, StringComparison.OrdinalIgnoreCase) && v is not null) return v;
-                    if (FindPlistValue(v, key) is { } nested) return nested;
+                    if (FindPlistValue(v, key, depth + 1) is { } nested) return nested;
                 }
                 break;
             case List<object?> list:
                 foreach (var v in list)
-                    if (FindPlistValue(v, key) is { } nested) return nested;
+                    if (FindPlistValue(v, key, depth + 1) is { } nested) return nested;
                 break;
         }
         return null;
