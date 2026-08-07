@@ -454,6 +454,18 @@ public sealed class AirPlaySession : IAsyncDisposable
                     Log.Error("Setup", "FairPlay key unwrap failed — mirror decryption key unavailable; video will be BLACK", ex);
                 }
             }
+            else
+            {
+                // This gate failing silently was the biggest blind spot in the
+                // pipeline: without the unwrapped key, SETUP phase 2 configures
+                // the mirror stream with no decryption and every video frame is
+                // rejected — a live session with a solid black window.
+                string reason = _pairing.FairPlay.KeyMessage is null
+                    ? "fp-setup key message is null (FairPlay handshake incomplete)"
+                    : $"ekey length is {ekey.Length}B (expected 72)";
+                Log.Error("Setup",
+                    $"FairPlay stream key NOT unwrapped — {reason}. Mirror decryption key unavailable; video will be BLACK");
+            }
 
             int eventPort  = OpenEventChannel();
             int timingPort = OpenTimingChannel();
@@ -473,8 +485,17 @@ public sealed class AirPlaySession : IAsyncDisposable
 
                 if (type == 110) // video mirroring
                 {
-                    _streamConnectionId =
-                        stream.TryGetValue("streamConnectionID", out var c) && c is long cl ? cl : 0;
+                    if (stream.TryGetValue("streamConnectionID", out var c) && c is long cl)
+                    {
+                        _streamConnectionId = cl;
+                    }
+                    else
+                    {
+                        _streamConnectionId = 0;
+                        Log.Error("Setup",
+                            "streamConnectionID missing or not an integer in SETUP — falling back to 0; " +
+                            "the AES-CTR keystream will be derived from the wrong ID and video will not decrypt");
+                    }
 
                     _mirror = new MirrorStreamReceiver();
 
@@ -494,7 +515,10 @@ public sealed class AirPlaySession : IAsyncDisposable
                     }
                     else
                     {
-                        Log.Info("Setup", "mirror running without decryption (missing key/ecdh)");
+                        Log.Error("Setup",
+                            $"mirror running WITHOUT decryption (streamAesKey={(_streamAesKey is null ? "null" : "present")}, " +
+                            $"ecdhSecret={(_pairing.EcdhSecret is null ? "null" : "present")}) — " +
+                            "encrypted frames cannot be decoded; video WILL be black");
                     }
 
                     _mirror.Start();

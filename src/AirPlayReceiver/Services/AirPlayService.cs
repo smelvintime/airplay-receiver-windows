@@ -99,7 +99,9 @@ public sealed class AirPlayService : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Log.Info("AirPlay", $"Video decoder unavailable: {ex.Message}");
+            Log.Error("AirPlay",
+                $"Video decoder unavailable (ffmpeg.RootPath='{FFmpeg.AutoGen.ffmpeg.RootPath}') — " +
+                "mirroring sessions will connect but show no video", ex);
             _window?.UpdateHud("Video decoding unavailable — FFmpeg DLLs missing (ARCHITECTURE.md §5)");
             _decoder     = null;
             _rtpReceiver = null;
