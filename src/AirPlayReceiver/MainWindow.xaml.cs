@@ -49,6 +49,17 @@ public sealed partial class MainWindow : Window
     private double _streamWidth  = 1920;
     private double _streamHeight = 1080;
 
+    // Persistent HUD notice (e.g. "FFmpeg DLLs missing"): unlike transient
+    // session HUD text, it must survive session end — previously OnSessionEnded
+    // collapsed the HUD and the warning was gone forever after the first session.
+    private string? _persistentNotice;
+
+    // Session-start watchdog: fires once, 5 s after a session starts; if no
+    // video frame has been presented by then the session is "live but black",
+    // and the HUD points the user at the log file.
+    private DispatcherTimer? _noVideoWatchdog;
+    private long             _watchdogBaseline;   // PresentedFrames at session start
+
     // ── Construction ──────────────────────────────────────────────────────────
 
     public MainWindow()
@@ -156,6 +167,20 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
+    /// Shows a HUD notice that persists across sessions (e.g. "FFmpeg DLLs
+    /// missing"). Restored by <see cref="OnSessionEnded"/> instead of collapsed.
+    /// </summary>
+    public void ShowPersistentNotice(string text)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            _persistentNotice  = text;
+            InfoText.Text      = text;
+            InfoHud.Visibility = Visibility.Visible;
+        });
+    }
+
+    /// <summary>
     /// Called by AirPlayService when a session starts (hides idle overlay).
     /// </summary>
     public void OnSessionStarted()
@@ -165,7 +190,30 @@ public sealed partial class MainWindow : Window
             _sessionActive = true;
             IdleOverlay.Visibility = Visibility.Collapsed;
             ShowFromTray();   // auto-open so the mirrored screen is visible on connect
+
+            // The "session started" signal only means the RTSP RECORD verb
+            // arrived — it says nothing about video actually flowing. Check in
+            // 5 s whether any frame reached the presenter and say so if not.
+            _watchdogBaseline = Rendering.VideoPresenter.PresentedFrames;
+            _noVideoWatchdog?.Stop();
+            _noVideoWatchdog = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+            _noVideoWatchdog.Tick += OnNoVideoWatchdogTick;
+            _noVideoWatchdog.Start();
         });
+    }
+
+    private void OnNoVideoWatchdogTick(object? sender, object e)
+    {
+        _noVideoWatchdog?.Stop();
+        _noVideoWatchdog = null;
+
+        if (!_sessionActive) return;                                            // session already ended
+        if (Rendering.VideoPresenter.PresentedFrames > _watchdogBaseline) return; // video is flowing
+
+        string logPath = Log.CurrentLogFile ?? "(log file unavailable)";
+        InfoText.Text      = $"Session active but no video frames — see log: {logPath}";
+        InfoHud.Visibility = Visibility.Visible;
+        Log.Warn("Watchdog", "session active for 5s with zero presented frames — black-screen condition");
     }
 
     /// <summary>
@@ -176,8 +224,21 @@ public sealed partial class MainWindow : Window
         DispatcherQueue.TryEnqueue(() =>
         {
             _sessionActive = false;
+            _noVideoWatchdog?.Stop();
+            _noVideoWatchdog = null;
             IdleOverlay.Visibility = Visibility.Visible;
-            InfoHud.Visibility     = Visibility.Collapsed;
+
+            // Keep (restore) a persistent notice such as "FFmpeg DLLs missing";
+            // only transient session HUD text is cleared.
+            if (_persistentNotice is not null)
+            {
+                InfoText.Text      = _persistentNotice;
+                InfoHud.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                InfoHud.Visibility = Visibility.Collapsed;
+            }
         });
     }
 
