@@ -397,28 +397,41 @@ public sealed class ReverseChannelRegistry : IDisposable
     /// </summary>
     public bool Register(ReverseChannel channel)
     {
+        // Subscribe BEFORE the channel becomes reachable. This used to add to
+        // _bySession, release the lock, and only then wire Closed — and a write
+        // that failed in that window fired Closed with no subscriber, so Detach
+        // never ran and the disposed channel stayed in the map forever. Because
+        // the duplicate check below did not filter on IsOpen, that zombie then
+        // 421ed every future /reverse for the session, permanently.
+        channel.Closed += OnChannelClosed;
+
         lock (_sync)
         {
             if (_disposed)
             {
                 Log.Warn("Reverse", $"Register refused (shutting down): session={channel.SessionId} purpose={channel.Purpose}");
+                channel.Closed -= OnChannelClosed;
                 return false;
             }
 
             if (!_bySession.TryGetValue(channel.SessionId, out var list))
                 _bySession[channel.SessionId] = list = new List<ReverseChannel>(1);
 
+            // Drop anything already closed: a channel the phone hung up on holds
+            // no resources but would still block a legitimate re-registration.
+            list.RemoveAll(c => !c.IsOpen);
+
             if (string.Equals(channel.Purpose, ReverseChannel.PurposeEvent, StringComparison.OrdinalIgnoreCase) &&
-                list.Exists(c => string.Equals(c.Purpose, ReverseChannel.PurposeEvent, StringComparison.OrdinalIgnoreCase)))
+                list.Exists(c => string.Equals(c.Purpose, ReverseChannel.PurposeEvent, StringComparison.OrdinalIgnoreCase) && c.IsOpen))
             {
                 Log.Warn("Reverse", $"Register refused — session={channel.SessionId} already has an event channel");
+                channel.Closed -= OnChannelClosed;
                 return false;
             }
 
             list.Add(channel);
         }
 
-        channel.Closed += OnChannelClosed;
         channel.Start();
         Log.Info("Reverse", $"Channel registered: session={channel.SessionId} purpose={channel.Purpose} " +
                             $"remote={channel.Remote} (registry now holds {Count})");
