@@ -240,8 +240,11 @@ public sealed class HlsServer : IAsyncDisposable
         var head = new StringBuilder();
         head.Append("HTTP/1.1 ").Append(status.ToString(CultureInfo.InvariantCulture)).Append(' ').Append(reason).Append("\r\n");
         head.Append("Date: ").Append(DateTime.UtcNow.ToString("r", CultureInfo.InvariantCulture)).Append("\r\n");
-        head.Append("Access-Control-Allow-Origin: *\r\n");
-        head.Append("Access-Control-Allow-Headers: Content-type\r\n");
+        // No Access-Control-* headers, deliberately. The only client here is our
+        // own FFmpeg, which does not consult CORS at all — so the wildcard bought
+        // nothing and told any browser-hosted local page that guessed the
+        // ephemeral port it could read cached playlists, short-lived signed CDN
+        // URLs included.
         if (payload.Length > 0)
             head.Append("Content-Type: ").Append(PlaylistContentType).Append("\r\n");
         head.Append("Content-Length: ").Append(payload.Length.ToString(CultureInfo.InvariantCulture)).Append("\r\n");

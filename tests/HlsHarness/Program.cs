@@ -268,11 +268,14 @@ internal static class Program
         Check("served master has the HLS content type",
               masterResponse.Content.Headers.ContentType?.ToString() == "application/x-mpegURL; charset=utf-8",
               masterResponse.Content.Headers.ContentType?.ToString() ?? "(none)");
-        Check("served master has the CORS headers",
-              masterResponse.Headers.TryGetValues("Access-Control-Allow-Origin", out var acao) && acao.First() == "*" &&
-              masterResponse.Headers.TryGetValues("Access-Control-Allow-Headers", out var acah) &&
-              acah.First() == "Content-type",
-              "missing CORS headers");
+        // No CORS, deliberately: the only client is our own FFmpeg, which ignores
+        // CORS entirely, so the wildcard only ever told a browser-hosted local page
+        // that guessed the ephemeral port it could read the cached playlists (and
+        // the short-lived signed CDN URLs inside them).
+        Check("served master sends no Access-Control-* headers",
+              !masterResponse.Headers.TryGetValues("Access-Control-Allow-Origin", out _) &&
+              !masterResponse.Headers.TryGetValues("Access-Control-Allow-Headers", out _),
+              "CORS headers are still present");
         Check("served master has a Date header", masterResponse.Headers.Date is not null, "no Date");
         Check("served master contains no mlhls:// URI",
               !masterBody.Contains("mlhls://", StringComparison.Ordinal), masterBody);
