@@ -1,0 +1,62 @@
+name: Build & Release
+
+# Produces a ready-to-run, zipped Windows build so people can just download it
+# instead of installing Visual Studio. Runs on any `v*` tag, and can also be
+# started by hand from the Actions tab.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # The native FFmpeg 7.x shared DLLs aren't committed (see .gitignore), so
+      # fetch a matching build and drop them where the csproj expects them.
+      - name: Fetch FFmpeg 7.x shared DLLs
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract
+          $bin = Get-ChildItem ffmpeg-extract -Recurse -Directory -Filter bin | Select-Object -First 1
+          $dest = 'src/AirPlayReceiver/native/x64'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "$($bin.FullName)/*.dll" $dest
+
+      - name: Publish (self-contained x64)
+        run: >
+          dotnet publish src/AirPlayReceiver/AirPlayReceiver.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:Platform=x64 -p:WindowsPackageType=None
+          -o publish
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/* -DestinationPath AirPlayReceiver-win-x64.zip
+
+      # Every run leaves a downloadable zip on the Actions run page, even
+      # without a tag.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirPlayReceiver-win-x64
+          path: AirPlayReceiver-win-x64.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AirPlayReceiver-win-x64.zip
+          generate_release_notes: true
