@@ -62,6 +62,14 @@ public sealed class VideoDecoder : IDisposable
     private int _lastHeight;
     private long _frameCount;   // decoded frames, for periodic progress logging
 
+    // App-wide decoded-frame total, read by the pipeline heartbeat
+    // (MirrorStreamReceiver). There is one decoder instance per app run, so a
+    // static is the least invasive wiring; Interlocked keeps cross-thread reads exact.
+    private static long s_decodedFrames;
+
+    /// <summary>Total video frames decoded since app start (all sessions).</summary>
+    public static long DecodedFrames => Interlocked.Read(ref s_decodedFrames);
+
     // ── Construction ──────────────────────────────────────────────────────────
 
     /// <param name="onFrame">
@@ -261,6 +269,8 @@ public sealed class VideoDecoder : IDisposable
                 outFrame    = _swFrame;
                 transferred = true;
             }
+
+            Interlocked.Increment(ref s_decodedFrames);
 
             // Invoke the render callback (VideoPresenter). The pointer is passed
             // as an IntPtr because Action<> can't take a pointer type argument.

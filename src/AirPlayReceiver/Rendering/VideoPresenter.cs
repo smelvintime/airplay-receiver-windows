@@ -67,6 +67,14 @@ public sealed unsafe class VideoPresenter : IDisposable
     private long _presentCount;    // frames presented, for periodic progress logging
     private bool _active = true;   // when false, drop frames and keep the surface black
 
+    // App-wide presented-frame total, read by the pipeline heartbeat
+    // (MirrorStreamReceiver) and MainWindow's no-video watchdog. One presenter
+    // instance per app run, so a static is the least invasive wiring.
+    private static long s_presentedFrames;
+
+    /// <summary>Total video frames presented since app start (all sessions).</summary>
+    public static long PresentedFrames => System.Threading.Interlocked.Read(ref s_presentedFrames);
+
     // ── Initialisation ────────────────────────────────────────────────────────
 
     /// <summary>
@@ -212,6 +220,7 @@ public sealed unsafe class VideoPresenter : IDisposable
 
             _swapChain.Present(1, PresentFlags.None);
 
+            System.Threading.Interlocked.Increment(ref s_presentedFrames);
             if (++_presentCount % 60 == 0)
                 Log.Info("Renderer", $"presented {_presentCount} frames ({w}×{h})");
         }

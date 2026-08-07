@@ -1,3 +1,4 @@
+using AirPlayReceiver.Rendering;
 using AirPlayReceiver.Services;
 using System;
 using System.Net;
@@ -36,6 +37,20 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
     private bool                _firstFrameLogged;
     private byte[]?             _spsPps;   // cached Annex-B SPS+PPS, prepended to each IDR
 
+    // ── Pipeline heartbeat ────────────────────────────────────────────────────
+    // Counters behind the 5-second "[Pipeline]" summary line — one glance
+    // diagnoses a black screen: rx=0 → stream never arrived (firewall);
+    // rejected≈rx → wrong decryption key; submitted>0 but decoded=0 → decoder
+    // problem; decoded>0 but presented=0 → renderer problem.
+    // Each counter has a single writer (the receive loop), so plain ints are
+    // fine; the timer thread only reads them.
+    private int    _framesReceived;   // type-0 video payloads seen
+    private int    _framesRejected;   // failed the AVCC walk after decrypt (key mismatch)
+    private int    _framesSubmitted;  // handed to the decoder
+    private long   _decodedBase;      // VideoDecoder.DecodedFrames at Start()
+    private long   _presentedBase;    // VideoPresenter.PresentedFrames at Start()
+    private Timer? _heartbeat;
+
     /// <summary>The TCP port the OS assigned; returned to iOS in the SETUP response.</summary>
     public int Port { get; private set; }
 
@@ -54,11 +69,24 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
 
         Log.Info("Mirror", $"Listening for video on TCP {Port} (decrypt={_crypto is not null}, decode={_decoder is not null})");
+
+        // Emit a pipeline summary every 5 seconds while the session is live.
+        _decodedBase   = VideoDecoder.DecodedFrames;
+        _presentedBase = VideoPresenter.PresentedFrames;
+        _heartbeat     = new Timer(_ => LogHeartbeat(),
+                                   null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+
         _acceptLoop = AcceptLoopAsync(_cts.Token);
     }
 
     public async Task StopAsync()
     {
+        _heartbeat?.Dispose();
+        _heartbeat = null;
+        // Final summary so sessions shorter than the timer period still leave
+        // one [Pipeline] line in the log.
+        LogHeartbeat();
+
         _cts?.Cancel();
         _listener?.Stop();
         if (_acceptLoop is not null)
@@ -67,6 +95,15 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             catch (Exception ex) when (ex is OperationCanceledException or SocketException or ObjectDisposedException) { }
         }
         Log.Info("Mirror", "Stopped.");
+    }
+
+    private void LogHeartbeat()
+    {
+        long decoded   = VideoDecoder.DecodedFrames     - _decodedBase;
+        long presented = VideoPresenter.PresentedFrames - _presentedBase;
+        Log.Info("Pipeline",
+            $"rx={_framesReceived} rejected={_framesRejected} submitted={_framesSubmitted} " +
+            $"decoded={decoded} presented={presented} decrypt={(_crypto is not null ? "yes" : "no")} (5s)");
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
@@ -133,6 +170,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
 
     private void HandleVideoFrame(byte[] payload)
     {
+        _framesReceived++;
         if (payload.Length == 0) return;
 
         _crypto?.Decrypt(payload, payload.Length);
@@ -141,7 +179,12 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         if (!ConvertAvccToAnnexBInPlace(payload))
         {
             // Malformed after decryption almost always means the key is wrong.
-            Log.Info("Mirror", "video frame not valid AVCC after decrypt (key mismatch?)");
+            // Log the first occurrence loudly, then just count: the [Pipeline]
+            // heartbeat reports the running rejected total every 5 seconds.
+            if (_framesRejected++ == 0)
+                Log.Error("Mirror",
+                    "video frame not valid AVCC after decrypt (key mismatch?) — " +
+                    "suppressing per-frame logs; watch rejected= in [Pipeline]");
             return;
         }
 
@@ -165,7 +208,11 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             Buffer.BlockCopy(payload, 0, toDecode, _spsPps.Length, payload.Length);
         }
 
-        _decoder?.SubmitPacket(toDecode);
+        if (_decoder is not null)
+        {
+            _decoder.SubmitPacket(toDecode);
+            _framesSubmitted++;
+        }
     }
 
     private static bool ConvertAvccToAnnexBInPlace(byte[] buf)
