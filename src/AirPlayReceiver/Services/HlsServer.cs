@@ -130,10 +130,17 @@ public sealed class HlsServer : IAsyncDisposable
             {
                 // HTTP/1.1 keep-alive: FFmpeg fetches the master and then each
                 // child playlist, usually on one connection.
+                int requestsRead = 0;
                 while (!ct.IsCancellationRequested)
                 {
-                    RtspMessage? request = await RtspMessage.ReadAsync(stream, ct).ConfigureAwait(false);
+                    // Same rule as the RTSP server: bound the wait for the first
+                    // request so a local process that connects and says nothing
+                    // cannot park a connection here indefinitely.
+                    RtspMessage? request = await RtspMessage.ReadAsync(
+                        stream, ct, requestsRead == 0 ? RtspMessage.FirstMessageIdleTimeout : null)
+                        .ConfigureAwait(false);
                     if (request is null) break;   // client closed between requests
+                    requestsRead++;
 
                     byte[] response = BuildResponse(request);
                     await stream.WriteAsync(response, ct).ConfigureAwait(false);

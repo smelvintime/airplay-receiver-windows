@@ -27,6 +27,39 @@ public sealed class RtspMessage
     /// </summary>
     public const int MaxBodyBytes = 64 * 1024 * 1024;
 
+    /// <summary>
+    /// Longest single request line or header line accepted. The reader below is
+    /// byte-at-a-time into a StringBuilder with no natural end, so without this a
+    /// sender that never emits a newline grows one allocation until the process
+    /// dies. iOS's longest real header is a few hundred bytes of Cookie; 8 KB is
+    /// what common HTTP servers allow for the same reason.
+    /// </summary>
+    public const int MaxHeaderLineBytes = 8 * 1024;
+
+    /// <summary>
+    /// Ceiling on the whole header block. Without it, a sender that simply never
+    /// emits the blank line runs the same attack one short line at a time.
+    /// </summary>
+    public const int MaxHeaderBytes = 64 * 1024;
+
+    /// <summary>
+    /// How long a connection may take to deliver one complete message once its
+    /// first byte has arrived — the classic slowloris dribble, bounded. Deliberately
+    /// generous: the worst legitimate case is a multi-megabyte photo body over
+    /// congested Wi-Fi.
+    /// </summary>
+    public static readonly TimeSpan MessageReadTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How long a freshly accepted connection may stay silent before its first
+    /// byte. Callers pass this for the first message only (see
+    /// <c>AirPlaySession.RunAsync</c>): an established AirPlay control connection
+    /// is legitimately quiet for long stretches — mirroring carries its media on
+    /// UDP — but a connection that never says anything at all is only there to
+    /// hold a slot against the server's concurrency cap.
+    /// </summary>
+    public static readonly TimeSpan FirstMessageIdleTimeout = TimeSpan.FromSeconds(15);
+
     // Request fields
     public string Method    { get; init; } = string.Empty;
     public string Uri       { get; init; } = string.Empty;
@@ -71,19 +104,71 @@ public sealed class RtspMessage
 
     /// <summary>
     /// Reads one complete RTSP/HTTP message from <paramref name="stream"/>.
-    /// Returns null when the stream closes cleanly between messages.
+    /// Returns null when the stream closes cleanly between messages, and also when
+    /// the message is refused (oversized, malformed or too slow) — in every case
+    /// the caller's answer is the same: stop reading this connection.
     /// </summary>
+    /// <param name="idleTimeout">
+    /// Optional bound on the wait for the message's <i>first</i> byte. Pass
+    /// <see cref="FirstMessageIdleTimeout"/> on a freshly accepted connection and
+    /// null afterwards; see that constant for why an established connection has no
+    /// idle bound.
+    /// </param>
     public static async Task<RtspMessage?> ReadAsync(
-        Stream stream, CancellationToken ct = default)
+        Stream stream, CancellationToken ct = default, TimeSpan? idleTimeout = null)
+    {
+        // Two deadlines on one timer: the idle bound (if the caller asked for one)
+        // until the first byte, then MessageReadTimeout for the rest. The token the
+        // callers hand us is the service-lifetime token, which never fires while
+        // the app is up, so a connection needs its own clock.
+        using var deadline = new CancellationTokenSource();
+        using var linked   = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
+        CancellationToken read = linked.Token;
+        if (idleTimeout is { } idle) deadline.CancelAfter(idle);
+
+        bool started = false;
+        try
+        {
+            return await ReadCoreAsync(stream, read, deadline, () => started = true);
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            Log.Warn("RTSP", started
+                ? $"Message not complete within {MessageReadTimeout.TotalSeconds:F0}s — closing the connection"
+                : $"No request within {idleTimeout?.TotalSeconds ?? 0:F0}s of connecting — closing the connection");
+            return null;
+        }
+    }
+
+    private static async Task<RtspMessage?> ReadCoreAsync(
+        Stream stream, CancellationToken ct, CancellationTokenSource deadline, Action onFirstByte)
     {
         // Read the request/status line + headers (terminated by a blank line).
         var headerLines = new List<string>();
         var lineBuffer  = new StringBuilder();
+        int headerBytes = 0;
+        bool first      = true;
 
         while (true)
         {
             int b = await ReadByteAsync(stream, ct);
             if (b < 0) return null; // EOF
+
+            if (first)
+            {
+                // The message has started: swap the idle bound for the completion
+                // bound (CancelAfter restarts the timer).
+                first = false;
+                onFirstByte();
+                deadline.CancelAfter(MessageReadTimeout);
+            }
+
+            if (++headerBytes > MaxHeaderBytes)
+            {
+                Log.Error("RTSP", $"Header block exceeded {MaxHeaderBytes}B without a blank line " +
+                                  "— closing the connection");
+                return null;
+            }
 
             // Terminate on ANY \n and strip one optional preceding \r — the same
             // rule ReverseChannel.ReadLineAsync already uses.
@@ -111,6 +196,12 @@ public sealed class RtspMessage
             }
             else
             {
+                if (lineBuffer.Length >= MaxHeaderLineBytes)
+                {
+                    Log.Error("RTSP", $"Header line exceeded {MaxHeaderLineBytes}B without a newline " +
+                                      "— closing the connection");
+                    return null;
+                }
                 lineBuffer.Append((char)b);
             }
         }

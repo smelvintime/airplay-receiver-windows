@@ -114,12 +114,21 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// </summary>
     public async Task RunAsync(Stream stream, CancellationToken ct)
     {
+        int messagesRead = 0;
+
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                RtspMessage? msg = await RtspMessage.ReadAsync(stream, ct);
-                if (msg is null) break; // client closed connection
+                // Only the first message gets an idle bound. A connection that
+                // never speaks is just holding a slot against RtspServer's
+                // concurrency cap, but an established control connection is
+                // legitimately quiet for long stretches (mirroring carries its
+                // media on UDP, not here).
+                RtspMessage? msg = await RtspMessage.ReadAsync(
+                    stream, ct, messagesRead == 0 ? RtspMessage.FirstMessageIdleTimeout : null);
+                if (msg is null) break; // client closed connection, or the message was refused
+                messagesRead++;
 
                 Log.Info("RTSP→", $"{msg}");
 

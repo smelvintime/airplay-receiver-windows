@@ -23,6 +23,25 @@ namespace AirPlayReceiver.Services;
 /// </summary>
 public sealed class RtspServer : IAsyncDisposable
 {
+    /// <summary>
+    /// Concurrent client connections accepted. iOS opens several per AirPlay
+    /// session — control, reverse/event, and a short-lived one per photo or
+    /// transport verb — so this is deliberately generous: it exists to stop an
+    /// unauthenticated LAN device from parking thousands of sockets (each with its
+    /// own session object and task), not to shape normal traffic.
+    ///
+    /// <c>Start(backlog: 4)</c> only bounds the kernel's pending-accept queue; it
+    /// puts no limit at all on connections we have already accepted.
+    /// </summary>
+    private const int MaxConcurrentConnections = 64;
+
+    /// <summary>
+    /// Refusals are attacker-triggered, so logging every one is itself a log-flood
+    /// lever (see Log's per-file cap). Log the first and then sparsely — enough for
+    /// a field test to reveal that the cap was reached.
+    /// </summary>
+    private const int RefusalLogInterval = 100;
+
     private readonly int  _port;
     private readonly Func<AirPlaySession> _sessionFactory;
     private readonly ReverseChannelRegistry _reverseChannels;
@@ -33,6 +52,8 @@ public sealed class RtspServer : IAsyncDisposable
 
     // Live client connections, so the UI can end the current session on demand.
     private readonly ConcurrentDictionary<TcpClient, byte> _clients = new();
+
+    private long _refusedConnections;
 
     public event Action<AirPlaySession>? SessionStarted;
     public event Action<AirPlaySession>? SessionEnded;
@@ -99,6 +120,21 @@ public sealed class RtspServer : IAsyncDisposable
             {
                 Log.Error("RTSP", $"Accept error: {ex.Message}");
                 break;
+            }
+
+            // HandleClientAsync registers the client synchronously before its first
+            // await, so this count is current by the time we come round again.
+            int live = _clients.Count;
+            if (live >= MaxConcurrentConnections)
+            {
+                long refused = Interlocked.Increment(ref _refusedConnections);
+                if (refused == 1 || refused % RefusalLogInterval == 0)
+                {
+                    Log.Warn("RTSP", $"Refusing connection: {live} live connections is the " +
+                                     $"{MaxConcurrentConnections} cap ({refused} refused so far)");
+                }
+                try { client.Close(); } catch { /* already gone */ }
+                continue;
             }
 
             // Each iOS connection gets its own session on a dedicated Task.
