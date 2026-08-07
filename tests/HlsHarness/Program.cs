@@ -181,7 +181,9 @@ internal static class Program
         var registry = new ReverseChannelRegistry();
         await using var hls = new HlsCoordinator(
             channels: registry,
-            onPlay:   (url, pos) => playEvents.Add((url, pos)),
+            // The third argument is the legacy Start-Position fraction, which only
+            // ever reaches the direct route; FCUP items always carry absolute seconds.
+            onPlay:   (url, pos, _) => playEvents.Add((url, pos)),
             onPauseReportPosition: () => { pauseCalls++; return pausePosition; });
 
         await using var receiver = new MiniReceiver(hls, registry);
