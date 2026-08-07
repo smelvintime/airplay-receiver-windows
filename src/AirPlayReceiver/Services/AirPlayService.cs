@@ -42,6 +42,11 @@ public sealed class AirPlayService : IAsyncDisposable
     private PhotoDecoder? _photoDecoder;
     private PhotoHandler? _photos;
 
+    // 1 once a photo session has raised the window. Photos re-assert the render
+    // surface per photo (see the onActive callback), so this separates that from
+    // the once-per-session window/tray transition.
+    private int _photoSessionShown;
+
     // Shared reverse (PTTH) channels, referenced by every session. Lives for the
     // whole app run: an upgraded socket outlives the RTSP connection it arrived on.
     private readonly ReverseChannelRegistry _reverseChannels = new();
@@ -137,8 +142,16 @@ public sealed class AirPlayService : IAsyncDisposable
             onRotation:   deg      => _presenter?.SetRotation(deg),
             onActive:     active   =>
             {
-                if (active) _window?.OnSessionStarted();
-                else        _window?.OnSessionEnded();
+                // Photos re-assert the surface on EVERY photo, deliberately: another
+                // producer (a clip in the same album ending) may have cleared it, and
+                // a latched flag meant later photos were silently dropped. But
+                // "the surface is live" and "a session just started" are different
+                // events — OnSessionStarted raises the window out of the tray, and
+                // doing that per photo would yank focus back on every slide.
+                bool wasActive = Interlocked.Exchange(ref _photoSessionShown, active ? 1 : 0) == 1;
+                if (active && !wasActive)  _window?.OnSessionStarted();
+                if (!active && wasActive)  _window?.OnSessionEnded();
+
                 _presenter?.SetActive(active);
                 _mdns?.SetSessionActive(active);
             });
