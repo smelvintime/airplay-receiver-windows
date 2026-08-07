@@ -206,18 +206,154 @@ internal static class Program
                   $"cache holds {rig.Handler.Cache.Count}");
             Check("session no longer active", !rig.Handler.SessionActive, "SessionActive was true");
         }
+
+        // ── Scenario 9: another producer switched the shared surface off ──────
+        // A Photos album can contain a video: iOS sends POST /play and then POST
+        // /stop, and the stop runs AirPlayVideoPlayer.Stop → SetActive(false) on
+        // the very surface the photos are using. Nothing tells the photo decoder.
+        // If it only activated the surface for the first photo of a session,
+        // every photo after the clip would be dropped by PresentFrame while
+        // Display still returned true and logged "displayed" — a black screen
+        // with a log claiming success, healed only by a TEARDOWN that a POST
+        // /stop does not imply.
+        using (var rig = new Rig())
+        {
+            rig.Put("/photo", photoA, key: "BEFORE-CLIP");
+            Check("photo before the clip reached the display path", rig.Sink.Frames.Count == 1,
+                  $"sink saw {rig.Sink.Frames.Count} frame(s)");
+
+            rig.Sink.DeactivateFromOtherProducer();   // POST /stop ended an AirPlay Video clip
+
+            var after = rig.Put("/photo", photoB, key: "AFTER-CLIP");
+            Check("photo after the clip → 200 OK", after.Status == 200, $"got {after.Status} {after.Reason}");
+            Check("photo after the clip re-activated the surface", rig.Sink.ActiveEvents is [true, true],
+                  $"onActive: {string.Join(",", rig.Sink.ActiveEvents)}");
+            Check("photo after the clip actually reached the display path",
+                  rig.Sink.Frames is [(1600, 1200), (1000, 666)],
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            Check("no photo was dropped by an inactive surface", rig.Sink.DroppedFrames == 0,
+                  $"{rig.Sink.DroppedFrames} frame(s) dropped");
+        }
+
+        // ── Scenario 10: a key whose spelling varies must not grow the MRU ────
+        // The entry dictionary matches asset keys case-insensitively; a List's
+        // Remove does not. When the two disagree, every repeat displayCached
+        // appends another MRU entry for an asset that is already there, and
+        // eviction then starts popping keys that are not the least-recently-used
+        // one — i.e. dropping a photo iOS is about to ask for.
+        using (var rig = new Rig())
+        {
+            const string Upper = "AABBCCDD-1111-2222-3333-444455556666";
+            string lower = Upper.ToLowerInvariant();
+
+            rig.Put("/photo", photoB, key: Upper, action: PhotoHandler.ActionCacheOnly);
+            for (int i = 0; i < 4; i++)
+                rig.Put("/photo", Array.Empty<byte>(), key: lower, action: PhotoHandler.ActionDisplayCached);
+
+            Check("a case-varying key hits the same cache entry", rig.Handler.Cache.Hits == 4,
+                  $"hits={rig.Handler.Cache.Hits}, misses={rig.Handler.Cache.Misses}");
+            Check("repeat displays keep one cache entry", rig.Handler.Cache.Count == 1,
+                  $"cache holds {rig.Handler.Cache.Count}");
+            Check("repeat displays do not grow the MRU list", rig.Handler.Cache.MruCount == 1,
+                  $"MRU holds {rig.Handler.Cache.MruCount} for {rig.Handler.Cache.Count} entry/entries");
+
+            rig.Put("/photo", photoB, key: lower, action: PhotoHandler.ActionCacheOnly);
+            Check("re-storing under another spelling replaces rather than duplicates",
+                  rig.Handler.Cache.Count == 1 && rig.Handler.Cache.MruCount == 1,
+                  $"{rig.Handler.Cache.Count} entry/entries, MRU {rig.Handler.Cache.MruCount}");
+            Check("the byte total counts that asset once", rig.Handler.Cache.Bytes == photoB.Length,
+                  $"cache holds {rig.Handler.Cache.Bytes}B, JPEG is {photoB.Length}B");
+        }
+
+        // ── Scenario 11: a preload-only session still tears down ──────────────
+        // TEARDOWN only calls EndSession when the handler reports a session open.
+        // A phone that preloads and then backs out of the album without ever
+        // displaying anything would otherwise leave the entire byte budget — up
+        // to 192 MB — plus the asset keys of a phone that has gone away, resident
+        // for the rest of the app's life.
+        using (var rig = new Rig())
+        {
+            rig.Put("/photo", photoA, key: "PRELOAD-1", action: PhotoHandler.ActionCacheOnly);
+            rig.Put("/photo", photoB, key: "PRELOAD-2", action: PhotoHandler.ActionCacheOnly);
+
+            Check("cacheOnly alone opens the session", rig.Handler.SessionActive, "SessionActive was false");
+            Check("cacheOnly alone displays nothing", rig.Sink.Frames.Count == 0,
+                  $"sink saw {rig.Sink.Frames.Count} frame(s)");
+            Check("both preloads are held", rig.Handler.Cache.Count == 2,
+                  $"cache holds {rig.Handler.Cache.Count}");
+
+            rig.Handler.EndSession();
+            Check("teardown released the preloaded bytes",
+                  rig.Handler.Cache.Count == 0 && rig.Handler.Cache.Bytes == 0,
+                  $"cache holds {rig.Handler.Cache.Count} entry/entries, {rig.Handler.Cache.Bytes}B");
+            Check("preload-only session is no longer active", !rig.Handler.SessionActive,
+                  "SessionActive was true");
+        }
+
+        // ── Scenario 12: the range conversion holds on the DOWNSCALE branch ───
+        // Scenario 6 pushes 64×64 → 64×64, which is libswscale's unscaled
+        // converter. Downscaling is a different code path with its own range
+        // handling — PhotoDecoder.AsFullRangeFormat records how differently the
+        // two can behave — and it is the one every real 12-megapixel photo takes.
+        // So send a flat photo past the 3840×2160 cap through the same real
+        // Display path and assert the luma that comes out the other end.
+        using (var rig = new Rig())
+        {
+            rig.Put("/photo", MakeFlatJpeg(4096, 2304, luma: 0), key: "BLACK-4K");
+            Check("oversized flat photo took the downscale branch", rig.Sink.Frames is [(3840, 2160)],
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            int black = rig.Sink.CenterLuma;
+            Check("downscaled full-range black (0) → limited-range 16", Math.Abs(black - 16) <= 2,
+                  $"NV12 luma is {black}");
+
+            rig.Put("/photo", MakeFlatJpeg(4096, 2304, luma: 255), key: "WHITE-4K");
+            int white = rig.Sink.CenterLuma;
+            Check("downscaled full-range white (255) → limited-range 235", Math.Abs(white - 235) <= 2,
+                  $"NV12 luma is {white}");
+        }
+
+        // ── Scenario 13: grayscale photos get the range conversion too ────────
+        // A black-and-white photo is a single-component JPEG and decodes to
+        // GRAY8, which has no YUVJ twin for AsFullRangeFormat to map it to. That
+        // is safe only because libswscale classifies every GRAY* format as
+        // full-range on its own — so assert the luma, on both branches, instead
+        // of trusting that to survive the next FFmpeg upgrade.
+        using (var rig = new Rig())
+        {
+            var r = rig.Put("/photo", MakeGrayJpeg(64, 64, luma: 0), key: "GRAY-BLACK");
+            Check("grayscale photo → 200 OK", r.Status == 200, $"got {r.Status} {r.Reason}");
+            Check("grayscale photo reached the display path", rig.Sink.Frames is [(64, 64)],
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            int black = rig.Sink.CenterLuma;
+            Check("grayscale black (0) → limited-range 16", Math.Abs(black - 16) <= 2,
+                  $"NV12 luma is {black}");
+
+            rig.Put("/photo", MakeGrayJpeg(64, 64, luma: 255), key: "GRAY-WHITE");
+            int white = rig.Sink.CenterLuma;
+            Check("grayscale white (255) → limited-range 235", Math.Abs(white - 235) <= 2,
+                  $"NV12 luma is {white}");
+
+            rig.Put("/photo", MakeGrayJpeg(4096, 2304, luma: 0), key: "GRAY-BLACK-4K");
+            Check("oversized grayscale took the downscale branch", rig.Sink.Frames[^1] == (3840, 2160),
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            int scaledBlack = rig.Sink.CenterLuma;
+            Check("downscaled grayscale black (0) → limited-range 16", Math.Abs(scaledBlack - 16) <= 2,
+                  $"NV12 luma is {scaledBlack}");
+        }
     }
 
     /// <summary>
     /// <c>--diag</c>: reproduces the measurement table quoted in
     /// <see cref="PhotoDecoder.AsFullRangeFormat"/>, which is why photos ask
     /// libswscale for the JPEG range conversion through the pixel format rather
-    /// than through <c>sws_setColorspaceDetails</c>. Re-run it after an FFmpeg
-    /// upgrade: if the first row stops reading 16/235 on both paths, the photo
-    /// colour handling needs revisiting.
+    /// than through <c>sws_setColorspaceDetails</c>, and why grayscale needs no
+    /// mapping of its own. Re-run it after an FFmpeg upgrade: if the YUVJ420P or
+    /// GRAY8 row stops reading 16/235 on both paths, the photo colour handling
+    /// needs revisiting.
     /// </summary>
     private static unsafe void Diag()
     {
+        Console.WriteLine($"ffmpeg {ffmpeg.av_version_info()}");
         Console.WriteLine("variant                                    in=0  in=255   (want 16 / 235)");
         foreach (var (name, fmt, details, dstCs) in new (string, AVPixelFormat, bool, int)[]
         {
@@ -226,20 +362,67 @@ internal static class Program
             ("YUV420P,  details dst=BT.709",       AVPixelFormat.AV_PIX_FMT_YUV420P,  true,  ffmpeg.SWS_CS_ITU709),
             ("YUV420P,  details dst=BT.601",       AVPixelFormat.AV_PIX_FMT_YUV420P,  true,  ffmpeg.SWS_CS_ITU601),
             ("YUVJ420P, details dst=BT.709",       AVPixelFormat.AV_PIX_FMT_YUVJ420P, true,  ffmpeg.SWS_CS_ITU709),
+            ("GRAY8,    no setColorspaceDetails",  AVPixelFormat.AV_PIX_FMT_GRAY8,    false, 0),
         })
         {
-            int a = ConvertFlat(0, fmt, details, dstCs);
-            int b = ConvertFlat(255, fmt, details, dstCs);
-            int c = ConvertFlat(0, fmt, details, dstCs, dst: 48);
-            int d = ConvertFlat(255, fmt, details, dstCs, dst: 48);
+            string a = Measure(0,   fmt, details, dstCs, dst: 64);
+            string b = Measure(255, fmt, details, dstCs, dst: 64);
+            string c = Measure(0,   fmt, details, dstCs, dst: 48);
+            string d = Measure(255, fmt, details, dstCs, dst: 48);
             Console.WriteLine($"{name,-42} {a,4}  {b,5}    scaled: {c,4} {d,5}");
         }
+
+        Console.WriteLine();
+        Console.WriteLine("'--'   libswscale did not write the destination at all.");
+        Console.WriteLine("'vary' the same configuration gave different answers on repeated runs,");
+        Console.WriteLine("       so there is no number to record for it.");
     }
 
-    /// <summary>Decodes a flat JPEG and runs one swscale configuration, returning the NV12 centre luma.</summary>
-    private static unsafe int ConvertFlat(byte luma, AVPixelFormat srcFmt, bool setDetails, int dstCs, int dst = 64)
+    /// <summary>
+    /// Runs one configuration several times and reports the value only if it is
+    /// the same every time. The <c>sws_setColorspaceDetails</c> configurations do
+    /// not reproduce on this build — neither between processes nor always within
+    /// one — and a table that quietly writes down whichever answer came back
+    /// first is worse than no table, because the next reader takes it for a
+    /// measurement.
+    /// </summary>
+    private static string Measure(byte luma, AVPixelFormat fmt, bool details, int dstCs, int dst)
     {
-        byte[] jpeg = MakeFlatJpeg(64, 64, luma);
+        string first = ConvertFlat(luma, fmt, details, dstCs, dst);
+        for (int repeat = 0; repeat < MeasureRepeats - 1; repeat++)
+            if (ConvertFlat(luma, fmt, details, dstCs, dst) != first) return "vary";
+        return first;
+    }
+
+    /// <summary>
+    /// How many times each cell is measured before it is believed. This detects
+    /// instability, it cannot prove stability, so the count is set well past the
+    /// point where the answer stops changing: at five repeats the table itself
+    /// still differed between runs, at sixty-four it does not. A 64x64 conversion
+    /// costs microseconds, so the whole sweep is still well under a second.
+    /// </summary>
+    private const int MeasureRepeats = 64;
+
+    /// <summary>
+    /// Pre-fill for the diagnostic's NV12 destination. <c>av_frame_get_buffer</c>
+    /// does not zero its allocation, so without this a configuration libswscale
+    /// declines to run reads back uninitialised heap and prints it as if it were
+    /// a luma value.
+    /// </summary>
+    private const byte SentinelLuma = 0xAA;
+
+    /// <summary>
+    /// Decodes a flat JPEG and runs one swscale configuration, returning the NV12
+    /// centre luma — or "--" when the conversion never happened, which a caller
+    /// must be able to tell apart from a luma value.
+    /// </summary>
+    private static unsafe string ConvertFlat(byte luma, AVPixelFormat srcFmt, bool setDetails, int dstCs, int dst = 64)
+    {
+        // A grayscale source needs a single-component JPEG; every other row of
+        // the table is read out of the ordinary three-component one.
+        byte[] jpeg = srcFmt == AVPixelFormat.AV_PIX_FMT_GRAY8
+            ? MakeGrayJpeg(64, 64, luma)
+            : MakeFlatJpeg(64, 64, luma);
 
         AVCodec* codec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_MJPEG);
         AVCodecContext* ctx = ffmpeg.avcodec_alloc_context3(codec);
@@ -247,33 +430,41 @@ internal static class Program
         AVPacket* pkt = ffmpeg.av_packet_alloc();
         AVFrame* f = ffmpeg.av_frame_alloc();
         fixed (byte* p = jpeg) { pkt->data = p; pkt->size = jpeg.Length; ffmpeg.avcodec_send_packet(ctx, pkt); }
-        ffmpeg.avcodec_receive_frame(ctx, f);
+        int decoded = ffmpeg.avcodec_receive_frame(ctx, f);
 
         SwsContext* sws = ffmpeg.sws_getContext(64, 64, srcFmt, dst, dst,
             AVPixelFormat.AV_PIX_FMT_NV12, ffmpeg.SWS_BILINEAR, null, null, null);
 
+        int details = 0;
         if (setDetails)
         {
             int* s = ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU601);
             int* d = ffmpeg.sws_getCoefficients(dstCs);
             var inv = new int_array4(); var tbl = new int_array4();
             for (uint i = 0; i < 4; i++) { inv[i] = s[i]; tbl[i] = d[i]; }
-            ffmpeg.sws_setColorspaceDetails(sws, in inv, 1, in tbl, 0, 0, 1 << 16, 1 << 16);
+            details = ffmpeg.sws_setColorspaceDetails(sws, in inv, 1, in tbl, 0, 0, 1 << 16, 1 << 16);
         }
 
         AVFrame* nv12 = ffmpeg.av_frame_alloc();
         nv12->format = (int)AVPixelFormat.AV_PIX_FMT_NV12; nv12->width = dst; nv12->height = dst;
         ffmpeg.av_frame_get_buffer(nv12, 32);
+
+        // Stamp the destination so a conversion that never ran cannot masquerade
+        // as a luma reading — see SentinelLuma.
+        for (int y = 0; y < dst; y++)
+            for (int x = 0; x < dst; x++) nv12->data[0][y * nv12->linesize[0] + x] = SentinelLuma;
+
         var dd = new byte_ptrArray4(); dd[0] = nv12->data[0]; dd[1] = nv12->data[1];
         var dl = new int_array4(); dl[0] = nv12->linesize[0]; dl[1] = nv12->linesize[1];
-        ffmpeg.sws_scale(sws, f->data, f->linesize, 0, 64, dd, dl);
+        int rows = ffmpeg.sws_scale(sws, f->data, f->linesize, 0, 64, dd, dl);
 
         int center = nv12->data[0][(dst / 2) * nv12->linesize[0] + dst / 2];
+        bool ran = decoded == 0 && details >= 0 && rows > 0 && center != SentinelLuma;
 
         ffmpeg.sws_freeContext(sws);
         ffmpeg.av_frame_free(&nv12); ffmpeg.av_frame_free(&f);
         ffmpeg.av_packet_free(&pkt); ffmpeg.avcodec_free_context(&ctx);
-        return center;
+        return ran ? center.ToString() : "--";
     }
 
     // ── Assertions ────────────────────────────────────────────────────────────
@@ -442,6 +633,15 @@ internal static class Program
         /// <summary>NV12 luma at the centre of the most recent frame — proves the range conversion ran.</summary>
         public int CenterLuma { get; private set; } = -1;
 
+        /// <summary>Frames the presenter would have thrown away because the surface was off.</summary>
+        public int DroppedFrames { get; private set; }
+
+        // Mirrors VideoPresenter's own active flag, which PresentFrame checks
+        // before touching the swap chain. Modelled here because that flag is
+        // shared by all three frame producers, so "the photo reached the display
+        // path" has to mean it got past this — not merely that Display() returned.
+        private bool _presenterActive;
+
         public PhotoDecoder Decoder { get; }
 
         public RecordingSink()
@@ -449,12 +649,23 @@ internal static class Program
             Decoder = new PhotoDecoder(
                 onFrame:      OnFrame,
                 onDimensions: (w, h) => Dimensions.Add((w, h)),
-                onActive:     a      => ActiveEvents.Add(a),
+                onActive:     a      => { ActiveEvents.Add(a); _presenterActive = a; },
                 onRotation:   d      => Rotations.Add(d));
         }
 
+        /// <summary>
+        /// Another producer switched the shared surface off — what a POST /stop
+        /// ending an AirPlay Video clip does, via AirPlayVideoPlayer.Stop and
+        /// AirPlayService's own onActive callback. It never reaches the photo
+        /// decoder's sinks, which is precisely why the decoder cannot assume an
+        /// earlier activation of its own still holds.
+        /// </summary>
+        public void DeactivateFromOtherProducer() => _presenterActive = false;
+
         private unsafe void OnFrame(IntPtr framePtr)
         {
+            if (!_presenterActive) { DroppedFrames++; return; }
+
             AVFrame* f = (AVFrame*)framePtr;
             Frames.Add((f->width, f->height));
 
@@ -481,6 +692,131 @@ internal static class Program
     /// <summary>A flat-luma JPEG (neutral chroma), for asserting the colour-range conversion.</summary>
     private static byte[] MakeFlatJpeg(int width, int height, byte luma)
         => MakeJpeg(width, height, seed: 0, flatLuma: luma);
+
+    /// <summary>
+    /// A baseline <b>single-component</b> JPEG of a flat luma value — the shape a
+    /// black-and-white photo arrives in, and the one FFmpeg decodes to
+    /// <c>AV_PIX_FMT_GRAY8</c> rather than to any YUV(J) format. That format has
+    /// no YUVJ twin for <c>PhotoDecoder.AsFullRangeFormat</c> to map it to, so it
+    /// is the case where the colour-range handling has to hold up unaided.
+    ///
+    /// Hand-assembled because no JPEG encoder in the bundled FFmpeg build will
+    /// emit one: mjpeg and ljpeg both reject <c>gray</c> and list only the
+    /// three-component formats. The bitstream is trivial for a flat image — with
+    /// an all-ones quantisation table every block is one DC coefficient,
+    /// 8·(luma−128), which the IDCT inverts exactly — followed by end-of-block,
+    /// so this is a little entropy coding rather than a JPEG encoder.
+    /// </summary>
+    private static byte[] MakeGrayJpeg(int width, int height, byte luma)
+    {
+        if (width % 8 != 0 || height % 8 != 0)
+            throw new ArgumentException("grayscale test JPEGs are built out of whole 8x8 blocks");
+
+        var jpeg = new List<byte>(1024);
+        void Marker(byte code) { jpeg.Add(0xFF); jpeg.Add(code); }
+        void Length(int payload) { jpeg.Add((byte)((payload + 2) >> 8)); jpeg.Add((byte)((payload + 2) & 0xFF)); }
+
+        Marker(0xD8);                                    // SOI
+
+        Marker(0xDB); Length(65); jpeg.Add(0x00);        // DQT, 8-bit, table 0
+        for (int i = 0; i < 64; i++) jpeg.Add(1);        // all ones: the DC survives exactly
+
+        Marker(0xC0); Length(9);                         // SOF0, baseline
+        jpeg.Add(8);
+        jpeg.Add((byte)(height >> 8)); jpeg.Add((byte)(height & 0xFF));
+        jpeg.Add((byte)(width  >> 8)); jpeg.Add((byte)(width  & 0xFF));
+        jpeg.Add(1);                                     // one component => grayscale
+        jpeg.Add(1); jpeg.Add(0x11); jpeg.Add(0);        // id 1, 1x1 sampling, quant table 0
+
+        Marker(0xC4); Length(1 + 16 + DcVals.Length);    // DHT, DC table 0
+        jpeg.Add(0x00); jpeg.AddRange(DcBits); jpeg.AddRange(DcVals);
+
+        Marker(0xC4); Length(1 + 16 + AcVals.Length);    // DHT, AC table 0
+        jpeg.Add(0x10); jpeg.AddRange(AcBits); jpeg.AddRange(AcVals);
+
+        Marker(0xDA); Length(6);                         // SOS
+        jpeg.Add(1); jpeg.Add(1); jpeg.Add(0x00);
+        jpeg.Add(0); jpeg.Add(63); jpeg.Add(0);
+
+        var dc = BuildHuffman(DcBits, DcVals);
+        var ac = BuildHuffman(AcBits, AcVals);
+        var bits = new JpegBitWriter();
+        int coefficient = 8 * (luma - 128);              // flat block => DC only
+        for (int block = 0, blocks = (width / 8) * (height / 8); block < blocks; block++)
+        {
+            int diff = block == 0 ? coefficient : 0;     // the DC is coded as a difference
+            int category = 0;
+            for (int magnitude = Math.Abs(diff); magnitude != 0; magnitude >>= 1) category++;
+
+            bits.Write(dc[category].Code, dc[category].Length);
+            if (category > 0) bits.Write(diff > 0 ? diff : diff + (1 << category) - 1, category);
+            bits.Write(ac[0x00].Code, ac[0x00].Length);  // EOB: no AC coefficients at all
+        }
+        bits.Pad();
+        jpeg.AddRange(bits.ToArray());
+
+        Marker(0xD9);                                    // EOI
+        return jpeg.ToArray();
+    }
+
+    // Annex K's example luminance Huffman tables — what baseline JPEGs in the
+    // wild carry, so the decode path this exercises is the ordinary one.
+    private static readonly byte[] DcBits = { 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0 };
+    private static readonly byte[] DcVals = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    private static readonly byte[] AcBits = { 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D };
+    private static readonly byte[] AcVals =
+    {
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+        0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+        0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+        0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+        0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+        0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+        0xF9, 0xFA,
+    };
+
+    /// <summary>Canonical Huffman codes from a JPEG (BITS, HUFFVAL) table pair.</summary>
+    private static (int Code, int Length)[] BuildHuffman(byte[] counts, byte[] values)
+    {
+        var table = new (int, int)[256];
+        int code = 0, v = 0;
+        for (int length = 1; length <= 16; length++)
+        {
+            for (int i = 0; i < counts[length - 1]; i++) table[values[v++]] = (code++, length);
+            code <<= 1;
+        }
+        return table;
+    }
+
+    /// <summary>MSB-first bit writer with JPEG's 0xFF byte stuffing.</summary>
+    private sealed class JpegBitWriter
+    {
+        private readonly List<byte> _bytes = new();
+        private int _accumulator, _held;
+
+        public void Write(int code, int length)
+        {
+            for (int i = length - 1; i >= 0; i--)
+            {
+                _accumulator = (_accumulator << 1) | ((code >> i) & 1);
+                if (++_held != 8) continue;
+
+                var b = (byte)_accumulator;
+                _bytes.Add(b);
+                if (b == 0xFF) _bytes.Add(0x00);   // stuffing: a bare 0xFF would start a marker
+                _accumulator = 0; _held = 0;
+            }
+        }
+
+        /// <summary>Flushes the last partial byte, padded with 1 bits as the spec requires.</summary>
+        public void Pad() { if (_held > 0) Write((1 << (8 - _held)) - 1, 8 - _held); }
+
+        public byte[] ToArray() => _bytes.ToArray();
+    }
 
     private static unsafe byte[] MakeJpeg(int width, int height, int seed, byte? flatLuma = null)
     {

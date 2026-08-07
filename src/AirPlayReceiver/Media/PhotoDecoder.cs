@@ -47,7 +47,7 @@ public sealed unsafe class PhotoDecoder : IDisposable
 
     private readonly Action<IntPtr>   _onFrame;       // (AVFrame* as IntPtr) NV12 frame
     private readonly Action<int, int> _onDimensions;  // (width, height) for letterboxing
-    private readonly Action<bool>     _onActive;      // true on first photo, false when the session ends
+    private readonly Action<bool>     _onActive;      // true on every photo, false when the session ends
     private readonly Action<int>      _onRotation;    // presenter rotation, always reset to 0 for photos
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -139,11 +139,20 @@ public sealed unsafe class PhotoDecoder : IDisposable
                 _onRotation(0);
                 _onDimensions(nv12->width, nv12->height);
 
-                if (!_active)
-                {
-                    _active = true;
-                    _onActive(true);   // shows the window, hides the idle overlay
-                }
+                // Re-assert on EVERY photo, not just the first. The presenter's
+                // active flag is shared with the other two frame producers (the
+                // video player and the mirror session), and any of them can
+                // clear it: an album containing a video runs POST /play then
+                // POST /stop, and the stop calls SetActive(false). Latching on
+                // our own _active would leave every later photo silently dropped
+                // by PresentFrame while this method still returned true and
+                // logged "displayed" — a black screen with a log claiming
+                // success, healed only by a TEARDOWN that POST /stop does not
+                // imply. SetActive(true) merely sets a flag (the clear-and-
+                // present work happens on false), so re-asserting costs nothing;
+                // AirPlayVideoPlayer.Play already does the same.
+                _active = true;
+                _onActive(true);   // shows the window, hides the idle overlay
 
                 _onFrame((IntPtr)nv12);
 
@@ -269,9 +278,9 @@ public sealed unsafe class PhotoDecoder : IDisposable
     {
         int srcW = src->width, srcH = src->height;
 
-        AVPixelFormat srcFmt   = (AVPixelFormat)src->format;
-        AVPixelFormat wireFmt  = AsFullRangeFormat(srcFmt, src->color_range);
-        bool          jpegRange = wireFmt != srcFmt || IsJpegFormat(srcFmt);
+        AVPixelFormat srcFmt    = (AVPixelFormat)src->format;
+        AVPixelFormat wireFmt   = AsFullRangeFormat(srcFmt, src->color_range);
+        bool          fullRange = ReadAsFullRange(wireFmt);
 
         (int dstW, int dstH) = FitWithin(srcW, srcH);
 
@@ -306,7 +315,7 @@ public sealed unsafe class PhotoDecoder : IDisposable
 
             _swsSrcW = srcW; _swsSrcH = srcH; _swsDstW = dstW; _swsDstH = dstH; _swsSrcFmt = wireFmt;
             Log.Info("Photo", $"scaler {srcW}×{srcH} {srcFmt} " +
-                              $"({(jpegRange ? "full" : "limited")} range, given to swscale as {wireFmt}) " +
+                              $"({(fullRange ? "full" : "limited")} range, given to swscale as {wireFmt}) " +
                               $"→ {dstW}×{dstH} NV12 (limited range)");
         }
 
@@ -340,21 +349,37 @@ public sealed unsafe class PhotoDecoder : IDisposable
     /// didn't work too well".
     ///
     /// The conversion has to be requested through the <b>pixel format</b>, not
-    /// through <c>sws_setColorspaceDetails</c>. Measured on the bundled FFmpeg
-    /// 7.1 build with a flat JPEG (input luma 0 and 255, want 16 and 235):
+    /// through <c>sws_setColorspaceDetails</c>. Measured by
+    /// <c>PhotoHarness --diag</c> on the bundled FFmpeg <b>n7.1.5</b> build with a
+    /// flat JPEG (input luma 0 and 255, want 16 and 235); re-run it after an
+    /// FFmpeg upgrade rather than trusting these numbers:
     /// <code>
     ///   source format   colorspace call        unscaled     downscaled
     ///   YUVJ420P        none                   16 / 235     16 / 235   ✓
     ///   YUV420P         none                    0 / 255      0 / 255   no conversion
-    ///   YUV420P         src 601 → dst 709      37 / 206     71 / 234   wrong, and size-dependent
-    ///   YUV420P         src 601 → dst 601       0 / 255     16 / 235   size-dependent
+    ///   YUV420P         src 601 → dst 709        vary         vary     not reproducible
+    ///   YUV420P         src 601 → dst 601       0 / 255      16 / 235  size-dependent
+    ///   YUVJ420P        src 601 → dst 709        vary         vary     not reproducible
+    ///   GRAY8           none                   16 / 235     16 / 235   ✓
     /// </code>
-    /// Only the format carries the range through both of libswscale's paths: an
-    /// identical source and destination size selects an unscaled plane-copy
-    /// converter that ignores the range flags entirely, so a photo needing no
-    /// downscale would come out different from one that did. The YUVJ formats
-    /// are deprecated and libswscale logs a notice about them; that is the
-    /// price of the only setting that is correct on both paths.
+    /// Only the format carries the range through both of libswscale's paths.
+    /// Asking for a BT.601 destination is merely size-dependent — an identical
+    /// source and destination size selects an unscaled converter that ignores the
+    /// range flags, so a photo needing no downscale would come out different from
+    /// one that did — but asking for a BT.709 one does not even give the same
+    /// answer twice on the same build ("vary" is the harness measuring one cell
+    /// 64 times and getting more than one value). The YUVJ formats are deprecated
+    /// and libswscale logs a notice about them; that is the price of the only
+    /// setting that is correct, and reproducible, on both paths.
+    ///
+    /// Grayscale needs no mapping and must not be given one: a black-and-white
+    /// photo is a single-component JPEG, which decodes to GRAY8 — a format with no
+    /// YUVJ twin, so the switch below returns it unchanged. That looks like a hole
+    /// and is not. libswscale's own <c>handle_jpeg()</c> classifies every GRAY*
+    /// format as full-range unconditionally, so it already converts, on both
+    /// paths, as the last row above records. Reaching for
+    /// <c>sws_setColorspaceDetails</c> to "fix" grayscale would trade a correct
+    /// result for the unreproducible rows in the middle of that table.
     ///
     /// Residual approximation: JPEG is BT.601 while the shader assumes BT.709,
     /// so hues are very slightly off. libswscale cannot convert a YUV matrix
@@ -390,6 +415,26 @@ public sealed unsafe class PhotoDecoder : IDisposable
         or AVPixelFormat.AV_PIX_FMT_YUVJ440P
         or AVPixelFormat.AV_PIX_FMT_YUVJ444P
         or AVPixelFormat.AV_PIX_FMT_YUVJ411P;
+
+    /// <summary>
+    /// Grayscale — what a black-and-white (single-component) JPEG decodes to.
+    /// These are the formats FFmpeg's MJPEG decoder emits for one component: 8-bit
+    /// photos give GRAY8, 12/16-bit ones GRAY16.
+    /// </summary>
+    private static bool IsGrayFormat(AVPixelFormat fmt) => fmt
+        is AVPixelFormat.AV_PIX_FMT_GRAY8
+        or AVPixelFormat.AV_PIX_FMT_GRAY16LE
+        or AVPixelFormat.AV_PIX_FMT_GRAY16BE;
+
+    /// <summary>
+    /// Whether libswscale will read this source format as full-range, and hence
+    /// perform the conversion to the presenter's limited range. Its internal
+    /// <c>handle_jpeg()</c> answers yes for the YUVJ twins <b>and</b> for every
+    /// grayscale format — see <see cref="AsFullRangeFormat"/> for why the second
+    /// half of that matters. Used only for the log line; the conversion itself is
+    /// driven by the format handed to <c>sws_getContext</c>.
+    /// </summary>
+    private static bool ReadAsFullRange(AVPixelFormat fmt) => IsJpegFormat(fmt) || IsGrayFormat(fmt);
 
     /// <summary>
     /// Largest even-sized box with the source aspect ratio that fits the display
