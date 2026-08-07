@@ -36,6 +36,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     private readonly VideoDecoder?     _decoder;       // mirror video sink (null if FFmpeg absent)
     private readonly AirPlayVideoPlayer _videoPlayer;  // shared AirPlay Video (URL playback) state
     private readonly ReverseChannelRegistry _reverseChannels; // shared receiver→phone (PTTH) channels
+    private readonly PhotoHandler      _photos;        // shared AirPlay Photos state (PUT /photo + asset cache)
 
     // Callbacks into the UI layer
     public event Action?         StreamStarted;
@@ -79,7 +80,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo,
                           VideoDecoder? decoder, AirPlayVideoPlayer videoPlayer,
-                          ReverseChannelRegistry reverseChannels)
+                          ReverseChannelRegistry reverseChannels, PhotoHandler photos)
     {
         _rtpReceiver     = rtpReceiver;
         _pairing         = pairing;
@@ -87,6 +88,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         _decoder         = decoder;
         _videoPlayer     = videoPlayer;
         _reverseChannels = reverseChannels;
+        _photos          = photos;
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -219,20 +221,74 @@ public sealed class AirPlaySession : IAsyncDisposable
         };
     }
 
-    private byte[] HandlePut(RtspMessage msg) => msg.Path switch
+    private byte[] HandlePut(RtspMessage msg)
     {
-        "/setProperty" => HandleSetProperty(msg),
-        _              => Ok(msg),
-    };
+        // AirPlay Photos is a protocol of its own: no /play, no FCUP, no RTP —
+        // a raw JPEG arrives on PUT /photo and has to appear on screen.
+        if (msg.Path.Equals("/photo", StringComparison.OrdinalIgnoreCase))
+            return _photos.Handle(msg);
 
-    private byte[] HandleGet(RtspMessage msg) => msg.Path switch
+        // Slideshow settings (PUT /slideshows/1). Not implemented — see
+        // LogSlideshowRequest; the 200 matches what this receiver already
+        // answered, and the dump gives the next field test something to work from.
+        if (msg.Path.StartsWith("/slideshows", StringComparison.OrdinalIgnoreCase))
+        {
+            LogSlideshowRequest(msg);
+            return Ok(msg);
+        }
+
+        return msg.Path switch
+        {
+            "/setProperty" => HandleSetProperty(msg),
+            _              => Ok(msg),
+        };
+    }
+
+    private byte[] HandleGet(RtspMessage msg)
     {
-        "/info"          => HandleInfo(msg),
-        "/playback-info" => HandlePlaybackInfo(msg),
-        "/server-info"   => HandleServerInfo(msg),
-        "/scrub"         => HandleScrub(msg),
-        _                => Ok(msg),
-    };
+        if (msg.Path.Equals("/slideshow-features", StringComparison.OrdinalIgnoreCase) ||
+            msg.Path.StartsWith("/slideshows", StringComparison.OrdinalIgnoreCase))
+        {
+            LogSlideshowRequest(msg);
+            return Ok(msg);
+        }
+
+        return msg.Path switch
+        {
+            "/info"          => HandleInfo(msg),
+            "/playback-info" => HandlePlaybackInfo(msg),
+            "/server-info"   => HandleServerInfo(msg),
+            "/scrub"         => HandleScrub(msg),
+            _                => Ok(msg),
+        };
+    }
+
+    /// <summary>
+    /// Slideshows are <b>not implemented</b>. They are a much larger protocol than
+    /// single photos: <c>GET /slideshow-features</c> advertises transition themes,
+    /// <c>PUT /slideshows/1</c> carries settings, and the receiver then <i>pulls</i>
+    /// each image with <c>GET /slideshows/1/assets/N</c> over three parallel
+    /// <c>X-Apple-Purpose: slideshow</c> reverse channels, reading a binary-plist
+    /// response body. That last part is the blocker: <see cref="ReverseChannel"/>'s
+    /// drain loop deliberately discards inbound bodies, so pulling assets needs a
+    /// request/response correlator built on top of it.
+    ///
+    /// Answering 200 with an empty body is what this receiver already did, so this
+    /// changes no behaviour — it only makes the requests visible. Deliberately not
+    /// advertising an empty <c>themes</c> array either: without a device to test
+    /// against, a truthful "I don't know" beats a guess that might make Photos
+    /// abandon the session instead of falling back to single-photo pushes, which
+    /// <b>are</b> implemented.
+    /// </summary>
+    private static void LogSlideshowRequest(RtspMessage msg)
+    {
+        LogVideoHeaders(msg);
+        byte[] body = msg.Body ?? Array.Empty<byte>();
+        Log.Warn("Photo", $"slideshow endpoint {msg.Method} {msg.Uri} is NOT IMPLEMENTED — " +
+                          $"answering 200 with an empty body (request body {body.Length}B)");
+        if (body.Length > 0)
+            Log.Info("Photo", $"slideshow body:\n{Encoding.UTF8.GetString(body, 0, Math.Min(body.Length, 4096))}");
+    }
 
     // ── AirPlay Video (URL playback) handlers ─────────────────────────────────
 
@@ -831,6 +887,30 @@ public sealed class AirPlaySession : IAsyncDisposable
     private byte[] HandleTeardown(RtspMessage msg)
     {
         Log.Info("RTSP", "TEARDOWN received.");
+
+        // A photo session has no /stop verb — TEARDOWN is the only unambiguous
+        // "the user is done" signal, so this is where the surface is cleared and
+        // the asset cache dropped. Deliberately not in RunAsync's finally: iOS
+        // uses several short-lived control connections per session, and any one
+        // of them closing would otherwise wipe the photo still being looked at.
+        if (_photos.SessionActive)
+        {
+            // Tell the phone first, while its reverse channel is still open —
+            // RunAsync's finally closes it moments later.
+            if (_appleSessionId is not null)
+            {
+                Log.Info("Photo", $"sending photo/stopped event on session={_appleSessionId}");
+                _ = _reverseChannels.SendEventAsync(_appleSessionId, "photo", "stopped");
+            }
+            else
+            {
+                Log.Info("Photo", $"no {ReverseChannel.SessionIdHeader} seen on this connection — " +
+                                  "skipping the photo/stopped event");
+            }
+
+            _photos.EndSession();
+        }
+
         return BuildOk(msg.CSeq);
     }
 

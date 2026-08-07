@@ -29,6 +29,14 @@ public sealed class AirPlayService : IAsyncDisposable
     // Constructed in StartAsync once the presenter it renders to exists.
     private AirPlayVideoPlayer? _videoPlayer;
 
+    // Shared AirPlay Photos state: the JPEG→NV12 display path and the asset
+    // cache behind X-Apple-AssetAction. Shared for the same reason the video
+    // player is — iOS spreads one Photos session over several short-lived
+    // control connections, so a per-session cache would 412 on every
+    // displayCached that landed on a different connection than its cacheOnly.
+    private PhotoDecoder? _photoDecoder;
+    private PhotoHandler? _photos;
+
     // Shared reverse (PTTH) channels, referenced by every session. Lives for the
     // whole app run: an upgraded socket outlives the RTSP connection it arrived on.
     private readonly ReverseChannelRegistry _reverseChannels = new();
@@ -92,6 +100,25 @@ public sealed class AirPlayService : IAsyncDisposable
                 _presenter?.SetActive(active);
             });
 
+        // AirPlay Photos renders to that same presenter: a JPEG is decoded to
+        // NV12 and pushed down the identical sink, so photos inherit the
+        // letterboxing, fullscreen and idle-overlay behaviour for free and there
+        // is only ever one thing on the surface.
+        _photoDecoder = new PhotoDecoder(
+            onFrame:      framePtr => _presenter!.PresentFrame(framePtr),
+            onDimensions: (w, h)   => _window?.UpdateStreamDimensions(w, h),
+            onRotation:   deg      => _presenter?.SetRotation(deg),
+            onActive:     active   =>
+            {
+                if (active) _window?.OnSessionStarted();
+                else        _window?.OnSessionEnded();
+                _presenter?.SetActive(active);
+            });
+
+        _photos = new PhotoHandler(
+            display:     _photoDecoder.Display,
+            stopDisplay: _photoDecoder.Stop);
+
         // ── 2. Video decoder + RTP receiver ───────────────────────────────────
         // FFmpeg is optional on first launch: if the native DLLs aren't present
         // (see ARCHITECTURE.md §5) the decoder init throws, but discovery and the
@@ -142,6 +169,7 @@ public sealed class AirPlayService : IAsyncDisposable
         _reverseChannels.Dispose();
 
         _videoPlayer?.Dispose();
+        _photoDecoder?.Dispose();
         _presenter?.Dispose();
         _decoder?.Dispose();
 
@@ -157,6 +185,9 @@ public sealed class AirPlayService : IAsyncDisposable
         // Upgraded reverse sockets are no longer tracked by the RTSP server, so
         // they have to be closed here too or the phone keeps a half-live session.
         _reverseChannels.CloseAll();
+        // A Photos session ends on TEARDOWN, which we will never see now that the
+        // control connections are gone — clear the surface and the asset cache here.
+        _photos?.EndSession();
     }
 
     // ── Session factory ───────────────────────────────────────────────────────
@@ -164,7 +195,8 @@ public sealed class AirPlayService : IAsyncDisposable
     private AirPlaySession CreateSession()
     {
         var pairing = new PairingHandler(_identity!);
-        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!, _reverseChannels);
+        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!,
+                                         _reverseChannels, _photos!);
 
         // Mirroring frames arrive already upright, so clear any rotation left over
         // from a previous AirPlay Video session before this stream renders.
