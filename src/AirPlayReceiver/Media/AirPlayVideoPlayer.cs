@@ -69,6 +69,33 @@ public sealed class AirPlayVideoPlayer : IDisposable
     private const string HttpUserAgent =
         "AppleCoreMedia/1.0.0.21A360 (Apple TV; U; CPU OS 17_0 like Mac OS X)";
 
+    /// <summary>
+    /// The only protocols FFmpeg may use for this URL and for everything it
+    /// reaches from it.
+    ///
+    /// Without a whitelist FFmpeg allows every protocol it was built with, and the
+    /// content behind the first URL decides which one gets used next: a playlist
+    /// can name <c>file://</c>, <c>concat:</c> or <c>subfile:</c> and turn the
+    /// demuxer into a file reader — the documented FFmpeg SSRF/LFI class. The
+    /// first URL here comes from an unauthenticated LAN sender, so this is not a
+    /// theoretical path.
+    ///
+    /// This is the narrowest set that still plays HLS: http/https for the
+    /// manifests and segments, tcp/tls underneath them, and crypto for the AES-128
+    /// segments an <c>#EXT-X-KEY</c> playlist uses. <c>file</c> is deliberately
+    /// absent — we never play local media.
+    ///
+    /// Note what this deliberately does <b>not</b> do: refuse URLs whose host is
+    /// loopback, private or link-local. That check cannot be applied here, because
+    /// the receiver's own playlist server <i>is</i> loopback
+    /// (<see cref="Services.HlsServer"/> serves every FCUP item from
+    /// 127.0.0.1) and the sender itself is by definition on a private LAN. The
+    /// protocol whitelist is what closes the file/LFI half of the class; the
+    /// remaining "fetch a LAN URL" half is indistinguishable from the app's normal
+    /// job.
+    /// </summary>
+    private const string ProtocolWhitelist = "http,https,tcp,tls,crypto";
+
     /// <summary>Per-read/connect timeout handed to the protocol layer (microseconds).</summary>
     private const string IoTimeoutMicros = "15000000";      // 15 s
 
@@ -461,6 +488,9 @@ public sealed class AirPlayVideoPlayer : IDisposable
             // Previously this call passed a null AVDictionary**, which meant the
             // default Lavf user-agent (403 from several CDNs), no timeouts at all
             // (a dead host blocked the thread forever) and no HLS reconnect.
+            // First, and never conditional: everything below only matters if the
+            // demuxer is confined to protocols we chose (see ProtocolWhitelist).
+            ffmpeg.av_dict_set(&opts, "protocol_whitelist", ProtocolWhitelist, 0);
             ffmpeg.av_dict_set(&opts, "user_agent",       HttpUserAgent, 0);
             ffmpeg.av_dict_set(&opts, "rw_timeout",       IoTimeoutMicros, 0);  // AVIO read/write
             ffmpeg.av_dict_set(&opts, "timeout",          IoTimeoutMicros, 0);  // tcp/http connect
