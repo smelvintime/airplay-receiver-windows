@@ -99,6 +99,17 @@ public sealed class AudioOutput : IDisposable
         }
     }
 
+    /// <summary>
+    /// Discards everything still queued. Used by the AirPlay Video route on a
+    /// seek: without it the pre-seek audio keeps playing for up to a second and
+    /// drags the audio clock backwards, so video waits for a position the stream
+    /// has already left.
+    /// </summary>
+    public void Clear()
+    {
+        _buffer?.ClearBuffer();
+    }
+
     public void Dispose()
     {
         try { _device?.Stop(); } catch { /* shutting down */ }

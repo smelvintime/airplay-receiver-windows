@@ -79,7 +79,10 @@ public sealed class AirPlayService : IAsyncDisposable
                 if (active) _window?.OnSessionStarted();
                 else        _window?.OnSessionEnded();
                 _presenter?.SetActive(active);
-            });
+            },
+            // A URL that won't open (DRM, dead host, 403) used to fail silently and
+            // leave the phone spinning on 0:00 — surface it on the HUD instead.
+            onNotice:     text     => _window?.ShowPersistentNotice(text));
 
         // ── 2. Video decoder + RTP receiver ───────────────────────────────────
         // FFmpeg is optional on first launch: if the native DLLs aren't present
