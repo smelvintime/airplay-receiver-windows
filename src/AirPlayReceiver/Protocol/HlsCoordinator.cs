@@ -57,11 +57,24 @@ public sealed class HlsCoordinator : IAsyncDisposable
     private readonly Action<string, double, double> _onPlay;
     private readonly Func<double>           _onPauseReportPosition; // pause; returns position in seconds
 
-    // RequestID → the playback item the request was issued for. iOS echoes the id
-    // back, which lets a late response for the previous item be told apart from
-    // the current one — the case that actually happens when an ad is inserted
-    // mid-cycle. (UxPlay reads the id for logging only and routes on URL alone.)
-    private readonly ConcurrentDictionary<int, HlsVideo> _pending = new();
+    /// <summary>
+    /// One FCUP request we have sent and not yet had answered.
+    ///
+    /// Recording the URL and the slot the request was issued for is what lets a
+    /// response be checked against the request it claims to answer, instead of
+    /// being written wherever a live counter happens to point.
+    /// </summary>
+    /// <param name="MediaIndex">Child-playlist slot, or -1 for the master.</param>
+    private sealed record PendingFcup(HlsVideo Video, string Url, int MediaIndex);
+
+    /// <summary>Master playlist request; there is no child slot to write into.</summary>
+    private const int MasterRequestIndex = -1;
+
+    // RequestID → the request we issued under it. iOS echoes the id back, which
+    // lets a late response for the previous item be told apart from the current
+    // one — the case that actually happens when an ad is inserted mid-cycle.
+    // (UxPlay reads the id for logging only and routes on URL alone.)
+    private readonly ConcurrentDictionary<int, PendingFcup> _pending = new();
     private int _fcupRequestId;
 
     /// <summary>Cache of playback items, keyed by the /play <c>uuid</c>.</summary>
@@ -218,7 +231,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
 
         Log.Info("HLS", $"FCUP cycle starting for uuid={uuid}: prefix='{uriPrefix}' → '{video.LocalUriPrefix}', " +
                         $"player will be pointed at {video.PlaybackLocation}");
-        SendFcupRequest(video, url);
+        SendFcupRequest(video, url, MasterRequestIndex);
     }
 
     // ── /action ───────────────────────────────────────────────────────────────
@@ -306,7 +319,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
             {
                 case "unhandledURLResponse":
                     if (parameters is null) { Log.Error("HLS", "/action unhandledURLResponse without 'params' — 400"); return BadRequest(msg); }
-                    HandleUnhandledUrlResponse(sessionId!, parameters);
+                    HandleUnhandledUrlResponse(parameters);
                     break;
 
                 case "playlistRemove":
@@ -333,7 +346,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
     }
 
     /// <summary>One playlist arriving from the phone: cache it, then ask for the next.</summary>
-    private void HandleUnhandledUrlResponse(string sessionId, Dictionary<string, object?> parameters)
+    private void HandleUnhandledUrlResponse(Dictionary<string, object?> parameters)
     {
         int    requestId  = ToInt(parameters.GetValueOrDefault("FCUP_Response_RequestID"));
         int    statusCode = ToInt(parameters.GetValueOrDefault("FCUP_Response_StatusCode"));
@@ -347,30 +360,34 @@ public sealed class HlsCoordinator : IAsyncDisposable
             return;
         }
 
-        // The blob is NOT null-terminated: decode exactly Length bytes. (UxPlay
-        // mallocs len+1 and writes the terminator itself, http_handlers.h:568.)
-        string playlist = Encoding.UTF8.GetString(data, 0, data.Length);
-
-        // Correlate by the echoed RequestID first: after a playlistInsert two
-        // cycles can briefly overlap, and the URL alone cannot tell them apart.
-        _pending.TryRemove(requestId, out HlsVideo? issuedFor);
-        HlsVideo? video = issuedFor ?? Store.Current;
-
-        if (video is null)
+        // Correlate by the echoed RequestID: after a playlistInsert two cycles can
+        // briefly overlap, and the URL alone cannot tell them apart.
+        if (!_pending.TryRemove(requestId, out PendingFcup? issued))
         {
-            Log.Error("HLS", $"FCUP response #{requestId} for {url} arrived with no playback item to attach it to " +
-                             "(session already torn down?) — ignoring");
+            // Nothing outstanding under that id: late, replayed or forged. This
+            // used to fall back to Store.Current and store the payload anyway, in
+            // whatever slot the live NextMediaUriIndex counter pointed at — which
+            // mislabels that rendition and permanently loses the real in-flight
+            // response for it. Fail closed instead.
+            Log.Error("HLS", $"FCUP response #{requestId} for {url} matches no request we issued — ignoring");
             return;
         }
 
-        if (issuedFor is null)
+        HlsVideo video = issued.Video;
+
+        // The response must answer the request it claims to. Without this, a
+        // replayed response lands in the slot the counter happens to be on and
+        // that rendition silently serves another rendition's chunks.
+        if (!string.Equals(url, issued.Url, StringComparison.Ordinal))
         {
-            Log.Warn("HLS", $"FCUP response #{requestId} for {url} does not match any request we issued — " +
-                            $"attributing it to the current item (uuid={video.Uuid})");
+            Log.Error("HLS", $"FCUP response #{requestId} carries {url} but that request asked for " +
+                             $"{issued.Url} — ignoring (uuid={video.Uuid})");
+            return;
         }
-        else if (!ReferenceEquals(issuedFor, Store.Current))
+
+        if (!ReferenceEquals(video, Store.Current))
         {
-            Log.Warn("HLS", $"FCUP response #{requestId} belongs to uuid={issuedFor.Uuid}, which is no longer current " +
+            Log.Warn("HLS", $"FCUP response #{requestId} belongs to uuid={video.Uuid}, which is no longer current " +
                             $"(current is {Store.Current?.Uuid ?? "(none)"}) — storing it against its own item");
         }
 
@@ -385,29 +402,39 @@ public sealed class HlsCoordinator : IAsyncDisposable
             return;
         }
 
+        // The blob is NOT null-terminated: decode exactly Length bytes. (UxPlay
+        // mallocs len+1 and writes the terminator itself, http_handlers.h:568.)
+        string playlist = Encoding.UTF8.GetString(data, 0, data.Length);
+
         Log.Info("HLS", $"FCUP response #{requestId} status={statusCode} url={url} ({data.Length}B playlist) " +
                         $"for uuid={video.Uuid}");
 
-        if (IsMasterResponse(url, video)) StoreMaster(video, playlist);
-        else                              StoreMedia(video, url, playlist);
+        // Which playlist this is comes from the request we issued, not from
+        // pattern-matching the URL: UxPlay routes on "url contains /master.m3u8",
+        // and a stray match mid-cycle re-enters StoreMaster, which clears every
+        // child slot and resets the fetch counter — throwing away everything
+        // already fetched for the item.
+        bool accepted = issued.MediaIndex == MasterRequestIndex
+            ? StoreMaster(video, playlist)
+            : StoreMedia(video, issued.MediaIndex, url, playlist);
 
-        PumpNext(video, sessionId);
+        // Only advance the cycle when the store actually took the response.
+        // Pumping regardless meant a rejected response still moved the queue on,
+        // so the slot it should have filled was never requested again.
+        if (accepted) PumpNext(video);
     }
 
-    /// <summary>
-    /// True when this response is the master playlist. UxPlay tests only for
-    /// "/master.m3u8"; also accepting an exact match on what we asked for first
-    /// keeps senders whose location ends in <c>/index.m3u8</c> working.
-    /// </summary>
-    private static bool IsMasterResponse(string url, HlsVideo video)
-        => url.Contains("/master.m3u8", StringComparison.OrdinalIgnoreCase) ||
-           string.Equals(url, video.ContentLocation, StringComparison.Ordinal);
-
-    private static void StoreMaster(HlsVideo video, string playlist)
+    private static bool StoreMaster(HlsVideo video, string playlist)
     {
         List<string> uris = HlsVideo.CollectMediaUris(playlist, video.UriPrefix);
         string rewritten  = HlsVideo.RewriteMaster(playlist, video.UriPrefix, video.LocalUriPrefix);
-        video.StoreMaster(rewritten, uris);
+
+        if (!video.StoreMaster(rewritten, uris))
+        {
+            Log.Error("HLS", $"A second master playlist arrived for uuid={video.Uuid} — ignoring it " +
+                             "(applying it would discard every child playlist already fetched)");
+            return false;
+        }
 
         Log.Info("HLS", $"Master playlist stored for uuid={video.Uuid}: {uris.Count} child playlist(s), " +
                         $"'{video.UriPrefix}' rewritten to '{video.LocalUriPrefix}'");
@@ -417,15 +444,16 @@ public sealed class HlsCoordinator : IAsyncDisposable
         if (uris.Count == 0)
             Log.Warn("HLS", $"Master playlist listed no URI starting with '{video.UriPrefix}' — " +
                             "playback will start with nothing to play");
+        return true;
     }
 
-    private static void StoreMedia(HlsVideo video, string url, string playlist)
+    /// <summary>
+    /// Caches one child playlist in the slot its request was issued for. Returns
+    /// false when the store refused it, i.e. nothing about the item changed.
+    /// </summary>
+    private static bool StoreMedia(HlsVideo video, int index, string url, string playlist)
     {
         int chunks = HlsVideo.AnalyzeMediaPlaylist(playlist, out double duration, out bool endList);
-
-        // The response answers the request we issued last, i.e. the index before
-        // the one we would ask for next (UxPlay: --uri_num).
-        int index = video.NextMediaUriIndex - 1;
 
         switch (video.StoreMedia(index, playlist, chunks, duration, endList))
         {
@@ -433,20 +461,20 @@ public sealed class HlsCoordinator : IAsyncDisposable
                 Log.Info("HLS", $"Media playlist [{index}] {url}: {chunks} chunk(s), " +
                                 $"{duration.ToString("F3", CultureInfo.InvariantCulture)}s total, " +
                                 $"{(endList ? "closed (#EXT-X-ENDLIST)" : "no #EXT-X-ENDLIST — live edge")}");
-                break;
+                return true;
 
             case HlsVideo.MediaStoreResult.Duplicate:
                 Log.Info("HLS", $"Media playlist [{index}] {url} duplicates an earlier URI — aliased, not stored twice");
-                break;
+                return true;
 
             case HlsVideo.MediaStoreResult.AlreadyPresent:
                 Log.Warn("HLS", $"Media playlist [{index}] {url} was already cached — keeping the copy we have");
-                break;
+                return false;
 
             default:
                 Log.Error("HLS", $"Media playlist for {url} has no slot at index {index} " +
                                  $"(the master listed {video.MediaUriCount}) — dropping it");
-                break;
+                return false;
         }
     }
 
@@ -457,7 +485,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
     /// may only follow the client's response to the previous one, so this is
     /// driven from inside the /action handler and never pipelined.
     /// </summary>
-    private void PumpNext(HlsVideo video, string sessionId)
+    private void PumpNext(HlsVideo video)
     {
         int next = video.NextMediaUriIndex;
         if (next < video.MediaUriCount)
@@ -467,7 +495,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
 
             video.NextMediaUriIndex = next + 1;
             Log.Info("HLS", $"Requesting child playlist {next + 1}/{video.MediaUriCount} for uuid={video.Uuid}");
-            SendFcupRequest(video, uri);
+            SendFcupRequest(video, uri, next);
             return;
         }
 
@@ -602,10 +630,10 @@ public sealed class HlsCoordinator : IAsyncDisposable
     /// <c>HTTP/1.1 200 OK</c> is drained by <see cref="ReverseChannel"/> and
     /// carries nothing — the answer comes back later as <c>POST /action</c>.
     /// </summary>
-    private void SendFcupRequest(HlsVideo video, string url)
+    private void SendFcupRequest(HlsVideo video, string url, int mediaIndex)
     {
         int requestId = Interlocked.Increment(ref _fcupRequestId);
-        _pending[requestId] = video;
+        _pending[requestId] = new PendingFcup(video, url, mediaIndex);
 
         if (!_channels.TryGet(video.AppleSessionId, out ReverseChannel? channel))
         {

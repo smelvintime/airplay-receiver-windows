@@ -144,17 +144,28 @@ public sealed class HlsVideo
         lock (_sync) return index >= 0 && index < _media.Count ? _media[index].Uri : null;
     }
 
-    /// <summary>Caches the master playlist (already rewritten) and the child URIs it listed.</summary>
-    public void StoreMaster(string rewrittenMaster, IReadOnlyList<string> mediaUris)
+    /// <summary>
+    /// Caches the master playlist (already rewritten) and the child URIs it listed.
+    /// Returns false when this item already holds a master.
+    ///
+    /// Refusing the second one is the point: this method clears every child slot
+    /// and resets the fetch counter, so a stray or replayed master arriving
+    /// mid-cycle would throw away every playlist already fetched for the item and
+    /// restart it from nothing.
+    /// </summary>
+    public bool StoreMaster(string rewrittenMaster, IReadOnlyList<string> mediaUris)
     {
         lock (_sync)
         {
+            if (MasterPlaylist is not null) return false;
+
             MasterPlaylist = rewrittenMaster;
             _media.Clear();
             foreach (string uri in mediaUris)
                 _media.Add(new MediaItem { Uri = uri });
         }
         NextMediaUriIndex = 0;
+        return true;
     }
 
     /// <summary>Outcome of <see cref="StoreMedia"/>.</summary>
