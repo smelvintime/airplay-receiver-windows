@@ -29,10 +29,11 @@ public sealed class AirPlayService : IAsyncDisposable
     // Constructed in StartAsync once the presenter it renders to exists.
     private AirPlayVideoPlayer? _videoPlayer;
 
-    // Must match the mDNS "features" TXT value (MdnsService.AirPlayFeatures):
-    // 0x5A7FFFF7,0x1E → (0x1E << 32) | 0x5A7FFFF7. Word 2 = 0x1E keeps the device
-    // reconnectable in the iOS picker (word 2 = 0x0 made it vanish after a session).
-    private const long AirPlayFeatures64 = 0x1E5A7FFFF7L;
+    // The numeric form of the mDNS "features" TXT value (MdnsService.AirPlayFeatures),
+    // returned by GET /info. The two representations must agree:
+    //   "0x5A7FFFF7,0xE" → (0xE << 32) | 0x5A7FFFF7 == 0xE5A7FFFF7
+    // See MdnsService for why word 2 is 0xE (what a real Apple TV 3 advertises).
+    private const long AirPlayFeatures64 = 0xE5A7FFFF7L;
 
     // Callbacks into MainWindow (set via constructor — null-safe)
     private readonly MainWindow? _window;

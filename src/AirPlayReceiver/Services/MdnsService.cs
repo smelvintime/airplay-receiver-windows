@@ -24,29 +24,52 @@ namespace AirPlayReceiver.Services;
 /// </summary>
 public sealed class MdnsService : IAsyncDisposable
 {
-    // ── AirPlay feature flags ─────────────────────────────────────────────────
+    // ── Advertised identity ───────────────────────────────────────────────────
     //
-    // Each bit enables a capability iOS checks before showing the device.
-    // This value mirrors the defaults used by UxPlay and is known-good for
-    // screen mirroring with iOS 14–17.
+    // We impersonate an Apple TV 3 (AppleTV3,2). That model is the one every
+    // working open-source receiver claims, and it is the only identity coherent
+    // with srcvers 220.68 — an AirPlay-1-era server version. Claiming a 4K model
+    // (AppleTV6,2) alongside srcvers 220.68 is a combination that exists on no
+    // real device, and it invites iOS to expect AirPlay 2 semantics (transient
+    // pairing, PTP clock, HomeKit) that this receiver does not implement.
     //
-    // Bit layout documented at:
-    //   https://openairplay.github.io/airplay-spec/features.html
+    // A real Apple TV 3 advertises, in _airplay._tcp TXT:
+    //   features=0x5A7FFFF7,0xE   flags=0x44   model=AppleTV3,2
+    //   srcvers=220.68            protovers=1.0
     //
-    // Word 1 (0x5A7FFFF7) carries the screen-mirroring + AirPlay-video/HLS bits.
-    // Word 2 = 0x1E is the known-good value for the iOS Screen Mirroring picker:
-    // it keeps the receiver visible AND reconnectable after a session ends.
+    // features — 64-bit capability bitmask, printed as "word1,word2" (lo,hi).
+    //   Bit layout: https://openairplay.github.io/airplay-spec/features.html
     //
-    // (We briefly tried word 2 = 0x0 — matching UxPlay, to chase HLS video-out —
-    //  but on this stack it made iOS DROP the device from the picker after the
-    //  first session, so you couldn't reconnect. Reverted. Pursue video-out via a
-    //  path that doesn't disturb word 2.)
-    private const string AirPlayFeatures  = "0x5A7FFFF7,0x1E";
-    private const string AirPlayModel     = "AppleTV6,2";   // Spoofed as Apple TV 4K
+    //   Word 1 (0x5A7FFFF7) carries the bits that gate the *video* advertisement:
+    //   bit 0 (Video) and bit 4 (VideoHTTPLiveStreams). Those two are exactly what
+    //   UxPlay's `-hls` option turns on, and both are set here.
+    //
+    //   Word 2 = 0xE, matching real Apple TV 3 hardware. (0x1E — which PhairPlay
+    //   also advertises — additionally sets bit 36, which is undocumented in every
+    //   published source and is not needed by anything we do.)
+    //
+    //   DO NOT "helpfully" add bits to this mask:
+    //     • bit 27 (SupportsLegacyPairing) must stay 1 — it is what keeps
+    //       post-pair-verify traffic UNENCRYPTED, the only mode a non-Apple
+    //       receiver can implement.
+    //     • word-2 bits 38/43/46/48 (CoreUtils / SystemPairing / HKPairing /
+    //       TransientPairing) must stay 0 — any of them makes iOS switch to
+    //       HomeKit-style pairing with AES-GCM-128 whose key derivation is not
+    //       public. Both 0xE and 0x1E satisfy this.
+    private const string AirPlayFeatures  = "0x5A7FFFF7,0xE";
+    private const string AirPlayModel     = "AppleTV3,2";   // Coherent with srcvers 220.68
+    private const string AirPlaySrcVers   = "220.68";       // AirPlay server version
+    private const string AirPlayProtoVers = "1.0";          // Advertised by real Apple TV 3
     private const string AirPlayOsVersion = "14.0";         // tvOS version string
 
-    // AirPlay status flags (0x04 = available, not busy)
-    private const string AirPlayStatusFlags = "0x04";
+    // ── Status flags ──────────────────────────────────────────────────────────
+    //
+    // The `flags` TXT field — not `features` — carries session/availability state.
+    // 0x44 = bit 2 (device supports AirPlay from one iOS device at a time /
+    // "PIN-less pairing supported") | bit 6 (device supports relay). It is what a
+    // real Apple TV 3 advertises while idle, and it matches the `statusFlags`=68
+    // this receiver already returns from GET /info.
+    private const string StatusFlagsIdle = "0x44";
 
     private readonly string     _deviceName;
     private readonly string     _deviceId;   // MAC-style: "AA:BB:CC:DD:EE:FF"
@@ -122,12 +145,13 @@ public sealed class MdnsService : IAsyncDisposable
     {
         // _airplay._tcp TXT record keys required by iOS:
         //   deviceid   — MAC address of this receiver
-        //   features   — 64-bit capability bitmask (hex, comma-separated hi/lo)
-        //   flags      — status (0x04 = idle/available)
-        //   model      — device model string (spoofed as Apple TV)
+        //   features   — 64-bit capability bitmask (hex, "word1,word2")
+        //   flags      — status/availability bitmask (0x44 idle, see StatusFlagsIdle)
+        //   model      — device model string (spoofed as Apple TV 3)
         //   pi         — persistent device GUID (use MAC for simplicity)
         //   pk         — Ed25519 public key (32 bytes, hex-encoded)
         //                  — required for AirPlay 2 pairing; placeholder here.
+        //   protovers  — AirPlay protocol version (1.0)
         //   srcvers    — AirPlay server version string
 
         var airplayProfile = new ServiceProfile(
@@ -138,15 +162,19 @@ public sealed class MdnsService : IAsyncDisposable
 
         AddTxt(airplayProfile, "deviceid",  _deviceId);
         AddTxt(airplayProfile, "features",  AirPlayFeatures);
-        AddTxt(airplayProfile, "flags",     AirPlayStatusFlags);
+        AddTxt(airplayProfile, "flags",     StatusFlagsIdle);
         AddTxt(airplayProfile, "model",     AirPlayModel);
         AddTxt(airplayProfile, "pi",        GuidFromMac(_deviceId));
         AddTxt(airplayProfile, "pk",        _publicKeyHex);
-        AddTxt(airplayProfile, "srcvers",   "220.68");
+        AddTxt(airplayProfile, "protovers", AirPlayProtoVers);
+        AddTxt(airplayProfile, "srcvers",   AirPlaySrcVers);
         AddTxt(airplayProfile, "osvers",    AirPlayOsVersion);
         AddTxt(airplayProfile, "vv",        "2");  // vendor version
 
         _sd.Advertise(airplayProfile);
+        Log.Info("mDNS",
+            $"_airplay._tcp advertised: features={AirPlayFeatures} flags={StatusFlagsIdle} " +
+            $"model={AirPlayModel} srcvers={AirPlaySrcVers} protovers={AirPlayProtoVers}");
     }
 
     private void RegisterRaopService()
@@ -163,20 +191,28 @@ public sealed class MdnsService : IAsyncDisposable
             port:         (ushort)_port
         );
 
-        // RAOP TXT keys (subset relevant to screen mirroring):
+        // RAOP TXT keys (subset relevant to screen mirroring). Real Apple TVs
+        // mirror four of the _airplay._tcp values into this record under short
+        // names, and iOS cross-checks them — so they must not drift apart:
+        //   ft ↔ features   sf ↔ flags   am ↔ model   vs ↔ srcvers
         AddTxt(raopProfile, "et",   "0,3,5");   // encryption types: none, RSA, FairPlay
         AddTxt(raopProfile, "md",   "0,1,2");   // metadata types
-        AddTxt(raopProfile, "vs",   "220.68");  // server version
+        AddTxt(raopProfile, "ft",   AirPlayFeatures);   // == _airplay features
+        AddTxt(raopProfile, "sf",   StatusFlagsIdle);   // == _airplay flags
+        AddTxt(raopProfile, "am",   AirPlayModel);      // == _airplay model
+        AddTxt(raopProfile, "vs",   AirPlaySrcVers);    // == _airplay srcvers
         AddTxt(raopProfile, "da",   "true");    // digest auth
         AddTxt(raopProfile, "sr",   "44100");   // sample rate (audio)
         AddTxt(raopProfile, "ss",   "16");      // sample size
         AddTxt(raopProfile, "ch",   "2");       // channels
         AddTxt(raopProfile, "vn",   "65537");
         AddTxt(raopProfile, "tp",   "UDP");
-        AddTxt(raopProfile, "am",   AirPlayModel);
         AddTxt(raopProfile, "pk",   _publicKeyHex);
 
         _sd.Advertise(raopProfile);
+        Log.Info("mDNS",
+            $"_raop._tcp advertised: instance={raopInstance} ft={AirPlayFeatures} " +
+            $"sf={StatusFlagsIdle} am={AirPlayModel} vs={AirPlaySrcVers}");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
