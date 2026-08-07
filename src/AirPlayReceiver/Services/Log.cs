@@ -49,7 +49,9 @@ public static class Log
                 Directory.CreateDirectory(dir);
                 PruneOldLogs(dir);
 
-                string path = Path.Combine(dir, $"airplay-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+                // Pid suffix: two instances starting in the same second must not
+                // fight over one filename (the loser would silently lose all logs).
+                string path = Path.Combine(dir, $"airplay-{DateTime.Now:yyyyMMdd-HHmmss}-{Environment.ProcessId}.log");
                 _writer = new StreamWriter(path, append: false, Encoding.UTF8) { AutoFlush = true };
                 CurrentLogFile = path;
             }
@@ -69,22 +71,36 @@ public static class Log
     public static void Warn(string tag, string msg) => Write("warn", tag, msg);
 
     public static void Error(string tag, string msg, Exception? ex = null)
-        => Write("error", tag, ex is null ? msg : $"{msg}\n{ex}");
+    {
+        string full = msg;
+        if (ex is not null)
+        {
+            // ex.ToString() can itself throw (exotic exception types); the
+            // crash handler in App.xaml.cs depends on this never propagating.
+            try { full = $"{msg}\n{ex}"; }
+            catch { full = $"{msg}\n(ex.ToString() failed: {ex.GetType().Name})"; }
+        }
+        Write("error", tag, full);
+    }
 
     // ── Implementation ────────────────────────────────────────────────────────
 
     private static void Write(string level, string tag, string msg)
     {
-        if (!_initialized) Init();
-
-        string line = $"{DateTime.Now:HH:mm:ss.fff} [{level}] [{tag}] {msg}";
-        System.Diagnostics.Debug.WriteLine(line);
-
-        lock (Sync)
+        try
         {
-            try { _writer?.WriteLine(line); }
-            catch { /* logging must never crash the app */ }
+            if (!_initialized) Init();
+
+            string line = $"{DateTime.Now:HH:mm:ss.fff} [{level}] [{tag}] {msg}";
+            System.Diagnostics.Debug.WriteLine(line);
+
+            lock (Sync)
+            {
+                try { _writer?.WriteLine(line); }
+                catch { /* logging must never crash the app */ }
+            }
         }
+        catch { /* formatting/init failure — logging must never crash the app */ }
     }
 
     /// <summary>

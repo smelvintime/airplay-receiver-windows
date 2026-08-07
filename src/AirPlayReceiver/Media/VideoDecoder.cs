@@ -276,8 +276,10 @@ public sealed class VideoDecoder : IDisposable
             // as an IntPtr because Action<> can't take a pointer type argument.
             _onFrame((IntPtr)outFrame);
 
+            // Debug-only: the 5s [Pipeline] heartbeat reports decoded counts in
+            // Release; a synchronous file write has no place on the decode thread.
             if (++_frameCount % 60 == 0)
-                Log.Info("Decoder", $"decoded {_frameCount} frames ({_lastWidth}×{_lastHeight})");
+                System.Diagnostics.Debug.WriteLine($"[Decoder] decoded {_frameCount} frames ({_lastWidth}×{_lastHeight})");
 
             if (transferred) ffmpeg.av_frame_unref(_swFrame);
             ffmpeg.av_frame_unref(_frame);

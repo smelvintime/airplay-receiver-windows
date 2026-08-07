@@ -42,6 +42,7 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract
           $bin = Get-ChildItem ffmpeg-extract -Recurse -Directory -Filter bin | Select-Object -First 1
+          if (-not $bin) { throw "bin/ folder not found in the FFmpeg zip - layout changed?" }
           $dest = 'src/AirPlayReceiver/native/x64'
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           Copy-Item "$($bin.FullName)/*.dll" $dest

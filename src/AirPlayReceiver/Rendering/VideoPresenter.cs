@@ -221,8 +221,10 @@ public sealed unsafe class VideoPresenter : IDisposable
             _swapChain.Present(1, PresentFlags.None);
 
             System.Threading.Interlocked.Increment(ref s_presentedFrames);
+            // Debug-only: the 5s [Pipeline] heartbeat reports presented counts in
+            // Release; never do file IO inside the render lock.
             if (++_presentCount % 60 == 0)
-                Log.Info("Renderer", $"presented {_presentCount} frames ({w}×{h})");
+                System.Diagnostics.Debug.WriteLine($"[Renderer] presented {_presentCount} frames ({w}×{h})");
         }
     }
 

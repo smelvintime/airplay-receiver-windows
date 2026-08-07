@@ -42,8 +42,9 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
     // diagnoses a black screen: rx=0 → stream never arrived (firewall);
     // rejected≈rx → wrong decryption key; submitted>0 but decoded=0 → decoder
     // problem; decoded>0 but presented=0 → renderer problem.
-    // Each counter has a single writer (the receive loop), so plain ints are
-    // fine; the timer thread only reads them.
+    // Incremented with Interlocked: AcceptLoopAsync spawns a receive loop per
+    // accepted connection, so a second (unexpected but unprevented) connection
+    // would otherwise race these writes and lose increments.
     private int    _framesReceived;   // type-0 video payloads seen
     private int    _framesRejected;   // failed the AVCC walk after decrypt (key mismatch)
     private int    _framesSubmitted;  // handed to the decoder
@@ -170,7 +171,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
 
     private void HandleVideoFrame(byte[] payload)
     {
-        _framesReceived++;
+        Interlocked.Increment(ref _framesReceived);
         if (payload.Length == 0) return;
 
         _crypto?.Decrypt(payload, payload.Length);
@@ -181,7 +182,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             // Malformed after decryption almost always means the key is wrong.
             // Log the first occurrence loudly, then just count: the [Pipeline]
             // heartbeat reports the running rejected total every 5 seconds.
-            if (_framesRejected++ == 0)
+            if (Interlocked.Increment(ref _framesRejected) == 1)
                 Log.Error("Mirror",
                     "video frame not valid AVCC after decrypt (key mismatch?) — " +
                     "suppressing per-frame logs; watch rejected= in [Pipeline]");
@@ -211,7 +212,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         if (_decoder is not null)
         {
             _decoder.SubmitPacket(toDecode);
-            _framesSubmitted++;
+            Interlocked.Increment(ref _framesSubmitted);
         }
     }
 
