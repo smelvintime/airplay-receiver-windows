@@ -206,6 +206,34 @@ internal static class Program
                   $"cache holds {rig.Handler.Cache.Count}");
             Check("session no longer active", !rig.Handler.SessionActive, "SessionActive was true");
         }
+
+        // ── Scenario 9: another producer switched the shared surface off ──────
+        // A Photos album can contain a video: iOS sends POST /play and then POST
+        // /stop, and the stop runs AirPlayVideoPlayer.Stop → SetActive(false) on
+        // the very surface the photos are using. Nothing tells the photo decoder.
+        // If it only activated the surface for the first photo of a session,
+        // every photo after the clip would be dropped by PresentFrame while
+        // Display still returned true and logged "displayed" — a black screen
+        // with a log claiming success, healed only by a TEARDOWN that a POST
+        // /stop does not imply.
+        using (var rig = new Rig())
+        {
+            rig.Put("/photo", photoA, key: "BEFORE-CLIP");
+            Check("photo before the clip reached the display path", rig.Sink.Frames.Count == 1,
+                  $"sink saw {rig.Sink.Frames.Count} frame(s)");
+
+            rig.Sink.DeactivateFromOtherProducer();   // POST /stop ended an AirPlay Video clip
+
+            var after = rig.Put("/photo", photoB, key: "AFTER-CLIP");
+            Check("photo after the clip → 200 OK", after.Status == 200, $"got {after.Status} {after.Reason}");
+            Check("photo after the clip re-activated the surface", rig.Sink.ActiveEvents is [true, true],
+                  $"onActive: {string.Join(",", rig.Sink.ActiveEvents)}");
+            Check("photo after the clip actually reached the display path",
+                  rig.Sink.Frames is [(1600, 1200), (1000, 666)],
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            Check("no photo was dropped by an inactive surface", rig.Sink.DroppedFrames == 0,
+                  $"{rig.Sink.DroppedFrames} frame(s) dropped");
+        }
     }
 
     /// <summary>
@@ -442,6 +470,15 @@ internal static class Program
         /// <summary>NV12 luma at the centre of the most recent frame — proves the range conversion ran.</summary>
         public int CenterLuma { get; private set; } = -1;
 
+        /// <summary>Frames the presenter would have thrown away because the surface was off.</summary>
+        public int DroppedFrames { get; private set; }
+
+        // Mirrors VideoPresenter's own active flag, which PresentFrame checks
+        // before touching the swap chain. Modelled here because that flag is
+        // shared by all three frame producers, so "the photo reached the display
+        // path" has to mean it got past this — not merely that Display() returned.
+        private bool _presenterActive;
+
         public PhotoDecoder Decoder { get; }
 
         public RecordingSink()
@@ -449,12 +486,23 @@ internal static class Program
             Decoder = new PhotoDecoder(
                 onFrame:      OnFrame,
                 onDimensions: (w, h) => Dimensions.Add((w, h)),
-                onActive:     a      => ActiveEvents.Add(a),
+                onActive:     a      => { ActiveEvents.Add(a); _presenterActive = a; },
                 onRotation:   d      => Rotations.Add(d));
         }
 
+        /// <summary>
+        /// Another producer switched the shared surface off — what a POST /stop
+        /// ending an AirPlay Video clip does, via AirPlayVideoPlayer.Stop and
+        /// AirPlayService's own onActive callback. It never reaches the photo
+        /// decoder's sinks, which is precisely why the decoder cannot assume an
+        /// earlier activation of its own still holds.
+        /// </summary>
+        public void DeactivateFromOtherProducer() => _presenterActive = false;
+
         private unsafe void OnFrame(IntPtr framePtr)
         {
+            if (!_presenterActive) { DroppedFrames++; return; }
+
             AVFrame* f = (AVFrame*)framePtr;
             Frames.Add((f->width, f->height));
 

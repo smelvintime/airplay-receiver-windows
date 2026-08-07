@@ -47,7 +47,7 @@ public sealed unsafe class PhotoDecoder : IDisposable
 
     private readonly Action<IntPtr>   _onFrame;       // (AVFrame* as IntPtr) NV12 frame
     private readonly Action<int, int> _onDimensions;  // (width, height) for letterboxing
-    private readonly Action<bool>     _onActive;      // true on first photo, false when the session ends
+    private readonly Action<bool>     _onActive;      // true on every photo, false when the session ends
     private readonly Action<int>      _onRotation;    // presenter rotation, always reset to 0 for photos
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -139,11 +139,20 @@ public sealed unsafe class PhotoDecoder : IDisposable
                 _onRotation(0);
                 _onDimensions(nv12->width, nv12->height);
 
-                if (!_active)
-                {
-                    _active = true;
-                    _onActive(true);   // shows the window, hides the idle overlay
-                }
+                // Re-assert on EVERY photo, not just the first. The presenter's
+                // active flag is shared with the other two frame producers (the
+                // video player and the mirror session), and any of them can
+                // clear it: an album containing a video runs POST /play then
+                // POST /stop, and the stop calls SetActive(false). Latching on
+                // our own _active would leave every later photo silently dropped
+                // by PresentFrame while this method still returned true and
+                // logged "displayed" — a black screen with a log claiming
+                // success, healed only by a TEARDOWN that POST /stop does not
+                // imply. SetActive(true) merely sets a flag (the clear-and-
+                // present work happens on false), so re-asserting costs nothing;
+                // AirPlayVideoPlayer.Play already does the same.
+                _active = true;
+                _onActive(true);   // shows the window, hides the idle overlay
 
                 _onFrame((IntPtr)nv12);
 
