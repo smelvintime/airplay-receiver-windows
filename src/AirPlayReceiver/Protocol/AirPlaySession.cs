@@ -376,21 +376,76 @@ public sealed class AirPlaySession : IAsyncDisposable
         return Ok(msg);
     }
 
+    /// <summary>
+    /// iOS polls this a few times a second while an AirPlay Video item is up. Three
+    /// distinct answers, all of them load-bearing:
+    ///
+    ///   • loading  → an <b>empty 200</b> with no Content-Type and no Content-Length.
+    ///     That is how a receiver says "still buffering"; iOS keeps polling.
+    ///   • playing  → the info plist below.
+    ///   • ended/failed → an empty 200 plus <c>Connection: close</c>. There is no
+    ///     "stopped" event in the protocol — the receiver ends an item by dropping
+    ///     the connection. This is what stops the phone spinning on a frozen 0:00
+    ///     after the player has died, which it did on every failure path before.
+    /// </summary>
     private byte[] HandlePlaybackInfo(RtspMessage msg)
     {
-        Log.Info("Video", $"GET /playback-info (ready={_videoPlayer.ReadyToPlay} pos={_videoPlayer.Position:F1} dur={_videoPlayer.Duration:F1})");
+        VideoPlaybackState state    = _videoPlayer.State;
+        double             position = _videoPlayer.Position;
+        double             duration = _videoPlayer.Duration;
+
+        Log.Info("Video", $"GET /playback-info (state={state} pos={Inv(position)} dur={Inv(duration)})");
+
+        if (state is VideoPlaybackState.Idle or VideoPlaybackState.Loading)
+            return RtspMessage.BuildResponse(200, "OK", msg.CSeq, protocol: msg.Version);
+
+        if (state is VideoPlaybackState.Ended or VideoPlaybackState.Failed)
+        {
+            // NOTE: we can only *ask* the client to close — RunAsync (owned by the
+            // reverse/dispatch work) is what would drop the socket on our side.
+            Log.Info("Video", $"playback {state} — empty 200 + Connection: close so the phone stops polling");
+            return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
+                new Dictionary<string, string> { ["Connection"] = "close" }, protocol: msg.Version);
+        }
+
+        // Both range arrays used to be empty, so iOS saw no seekable region at all
+        // and the scrubber was dead. One range each, matching what UxPlay emits.
+        var loadedTimeRanges = new List<object?>
+        {
+            new Dictionary<string, object?>
+            {
+                ["start"]    = position,
+                ["duration"] = duration > position ? duration - position : 0.0,
+            },
+        };
+
+        var seekableTimeRanges = new List<object?>();
+        if (_videoPlayer.CanSeek && duration > 0)
+            seekableTimeRanges.Add(new Dictionary<string, object?>
+            {
+                ["start"]    = 0.0,
+                ["duration"] = duration,
+            });
+
         var info = new Dictionary<string, object?>
         {
-            ["duration"]                = _videoPlayer.Duration,
-            ["position"]                = _videoPlayer.Position,
+            ["duration"]                = duration,
+            ["position"]                = position,
             ["rate"]                    = _videoPlayer.Rate,
-            ["readyToPlay"]             = _videoPlayer.ReadyToPlay,
-            ["playbackBufferEmpty"]     = !_videoPlayer.ReadyToPlay,
+            // Real receivers report readyToPlay=true whenever they answer with a
+            // body at all; "not ready" is the empty 200 above, not a false here.
+            ["readyToPlay"]             = true,
+            ["playbackBufferEmpty"]     = false,
             ["playbackBufferFull"]      = false,
-            ["playbackLikelyToKeepUp"]  = _videoPlayer.ReadyToPlay,
-            ["loadedTimeRanges"]        = new List<object?>(),
-            ["seekableTimeRanges"]      = new List<object?>(),
+            ["playbackLikelyToKeepUp"]  = true,
+            ["loadedTimeRanges"]        = loadedTimeRanges,
+            ["seekableTimeRanges"]      = seekableTimeRanges,
         };
+
+        // TODO(integration): UxPlay answers /playback-info as text/x-apple-plist+xml,
+        // not a binary plist. Flip the writer and this Content-Type together once
+        // Protocol/XmlPlist.cs (branch feat/reverse-channel) lands — changing one
+        // without the other would break a path that currently works.
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
             new Dictionary<string, string> { ["Content-Type"] = "application/x-apple-binary-plist" },
             BinaryPlist.Write(info), protocol: msg.Version);
@@ -814,8 +869,12 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandleGetProperty(RtspMessage msg)
     {
-        Log.Info("Video", $"getProperty {msg.Uri}");
-        return BuildOk(msg.CSeq);
+        string prop = msg.Uri.Contains('?') ? msg.Uri[(msg.Uri.IndexOf('?') + 1)..] : "(none)";
+        Log.Info("Video", $"getProperty '{prop}' (state={_videoPlayer.State})");
+        // BuildOk hardcodes RTSP/1.0; these arrive as HTTP/1.1 on the video-out
+        // control connections, so echo the request's protocol like every other
+        // video handler does.
+        return Ok(msg);
     }
 
     /// <summary>Dumps a video-out request's headers — the FCUP path keys off X-Apple-Session-ID and friends.</summary>
