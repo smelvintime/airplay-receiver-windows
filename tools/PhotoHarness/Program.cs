@@ -289,6 +289,28 @@ internal static class Program
             Check("preload-only session is no longer active", !rig.Handler.SessionActive,
                   "SessionActive was true");
         }
+
+        // ── Scenario 12: the range conversion holds on the DOWNSCALE branch ───
+        // Scenario 6 pushes 64×64 → 64×64, which is libswscale's unscaled
+        // converter. Downscaling is a different code path with its own range
+        // handling — PhotoDecoder.AsFullRangeFormat records how differently the
+        // two can behave — and it is the one every real 12-megapixel photo takes.
+        // So send a flat photo past the 3840×2160 cap through the same real
+        // Display path and assert the luma that comes out the other end.
+        using (var rig = new Rig())
+        {
+            rig.Put("/photo", MakeFlatJpeg(4096, 2304, luma: 0), key: "BLACK-4K");
+            Check("oversized flat photo took the downscale branch", rig.Sink.Frames is [(3840, 2160)],
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            int black = rig.Sink.CenterLuma;
+            Check("downscaled full-range black (0) → limited-range 16", Math.Abs(black - 16) <= 2,
+                  $"NV12 luma is {black}");
+
+            rig.Put("/photo", MakeFlatJpeg(4096, 2304, luma: 255), key: "WHITE-4K");
+            int white = rig.Sink.CenterLuma;
+            Check("downscaled full-range white (255) → limited-range 235", Math.Abs(white - 235) <= 2,
+                  $"NV12 luma is {white}");
+        }
     }
 
     /// <summary>
