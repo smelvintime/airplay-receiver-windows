@@ -70,11 +70,24 @@ public sealed class HlsCoordinator : IAsyncDisposable
     /// <summary>Master playlist request; there is no child slot to write into.</summary>
     private const int MasterRequestIndex = -1;
 
+    /// <summary>
+    /// Cycles that may wait for the wire at once. A real session never has more
+    /// than one — the advertisement's cycle, while the main content's insert
+    /// arrives — so this exists only so that a sender spamming playlistInsert
+    /// cannot grow the queue without bound.
+    /// </summary>
+    private const int MaxDeferredFcupRequests = 16;
+
     // RequestID → the request we issued under it. iOS echoes the id back, which
     // lets a late response for the previous item be told apart from the current
     // one — the case that actually happens when an ad is inserted mid-cycle.
     // (UxPlay reads the id for logging only and routes on URL alone.)
     private readonly ConcurrentDictionary<int, PendingFcup> _pending = new();
+
+    // Requests held back because one is already outstanding: the protocol forbids
+    // pipelining, so a second cycle has to wait for the first to answer.
+    private readonly ConcurrentQueue<PendingFcup> _deferred = new();
+
     private int _fcupRequestId;
 
     /// <summary>Cache of playback items, keyed by the /play <c>uuid</c>.</summary>
@@ -340,6 +353,13 @@ public sealed class HlsCoordinator : IAsyncDisposable
             // A malformed action must never take down the RTSP connection: iOS
             // would drop the whole AirPlay session.
             Log.Error("HLS", $"/action type '{type}' handler threw — acknowledging anyway", ex);
+        }
+        finally
+        {
+            // Every /action is a chance for the wire to have gone quiet, which is
+            // the only moment a deferred FCUP cycle may start. No-op while a
+            // request is still outstanding.
+            PumpDeferred();
         }
 
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq, protocol: msg.Version);
@@ -624,13 +644,58 @@ public sealed class HlsCoordinator : IAsyncDisposable
     // ── FCUP request ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Sends one FCUP request on the session's reverse channel.
+    /// Queues one FCUP request, sending it now only when the wire is free.
+    ///
+    /// FCUP-SPEC.md §5 is explicit that requests are never pipelined: the next may
+    /// only follow the client's response to the previous one. Keying
+    /// <see cref="_pending"/> by RequestID keeps responses attributable, but it
+    /// does not stop two <i>cycles</i> writing to the same reverse channel at
+    /// once — which is exactly what happened when a playlistInsert for the main
+    /// content arrived while a YouTube pre-roll was still fetching its children.
+    /// </summary>
+    private void SendFcupRequest(HlsVideo video, string url, int mediaIndex)
+    {
+        if (!_pending.IsEmpty)
+        {
+            if (_deferred.Count >= MaxDeferredFcupRequests)
+            {
+                Log.Error("HLS", $"Dropping the FCUP request for {url} (uuid={video.Uuid}) — " +
+                                 $"{_deferred.Count} cycles are already waiting, which is the " +
+                                 $"{MaxDeferredFcupRequests} ceiling");
+                return;
+            }
+
+            _deferred.Enqueue(new PendingFcup(video, url, mediaIndex));
+            Log.Info("HLS", $"FCUP request for {url} (uuid={video.Uuid}) deferred — a request is still " +
+                            $"outstanding and the protocol forbids pipelining ({_deferred.Count} waiting)");
+            return;
+        }
+
+        SendFcupRequestNow(video, url, mediaIndex);
+    }
+
+    /// <summary>
+    /// Starts the oldest deferred cycle, if the wire is free and one is waiting.
+    /// Called whenever an /action has been processed — the only moment at which a
+    /// request can have stopped being outstanding.
+    /// </summary>
+    private void PumpDeferred()
+    {
+        if (!_pending.IsEmpty) return;
+        if (!_deferred.TryDequeue(out PendingFcup? next)) return;
+
+        Log.Info("HLS", $"Wire is free — starting the deferred FCUP request for {next.Url} (uuid={next.Video.Uuid})");
+        SendFcupRequestNow(next.Video, next.Url, next.MediaIndex);
+    }
+
+    /// <summary>
+    /// Writes one FCUP request to the session's reverse channel.
     ///
     /// Fire-and-forget, like UxPlay's raw <c>send()</c>: the phone's
     /// <c>HTTP/1.1 200 OK</c> is drained by <see cref="ReverseChannel"/> and
     /// carries nothing — the answer comes back later as <c>POST /action</c>.
     /// </summary>
-    private void SendFcupRequest(HlsVideo video, string url, int mediaIndex)
+    private void SendFcupRequestNow(HlsVideo video, string url, int mediaIndex)
     {
         int requestId = Interlocked.Increment(ref _fcupRequestId);
         _pending[requestId] = new PendingFcup(video, url, mediaIndex);
@@ -640,6 +705,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
             _pending.TryRemove(requestId, out _);
             Log.Error("HLS", $"No reverse event channel for session={video.AppleSessionId} — " +
                              $"cannot request {url}. Playback cannot start without it.");
+            PumpDeferred();
             return;
         }
 
@@ -654,6 +720,9 @@ public sealed class HlsCoordinator : IAsyncDisposable
                            _pending.TryRemove(requestId, out _);
                            Log.Error("HLS", $"FCUP request #{requestId} for {url} was not sent — " +
                                             "the playlist will never arrive and playback will stall");
+                           // Nothing is outstanding any more, so a waiting cycle
+                           // must not be stranded behind the request that failed.
+                           PumpDeferred();
                        }
                    }, TaskScheduler.Default);
     }
