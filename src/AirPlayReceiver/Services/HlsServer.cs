@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -37,7 +38,18 @@ public sealed class HlsServer : IAsyncDisposable
     /// <summary>Content type Apple and every HLS player expect for an m3u8.</summary>
     private const string PlaylistContentType = "application/x-mpegURL; charset=utf-8";
 
+    /// <summary>
+    /// How long <see cref="StopAsync"/> waits for in-flight request tasks after
+    /// cancelling them. They unblock on the cancellation token; this is only
+    /// insurance, and shutdown must not hang on it.
+    /// </summary>
+    private const int ShutdownDrainMs = 2000;
+
     private readonly HlsPlaylistStore _store;
+
+    // The tasks serving accepted connections, so shutdown can wait for them
+    // rather than returning while they still touch the store.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
     private TcpListener?             _listener;
     private CancellationTokenSource? _cts;
@@ -91,6 +103,19 @@ public sealed class HlsServer : IAsyncDisposable
             catch (Exception ex) { Log.Warn("HLS", $"Accept loop ended with {ex.GetType().Name}: {ex.Message}"); }
             _acceptLoop = null;
         }
+
+        Task[] live = _connectionTasks.Keys.ToArray();
+        if (live.Length > 0)
+        {
+            Task all = Task.WhenAll(live);
+            if (await Task.WhenAny(all, Task.Delay(ShutdownDrainMs)).ConfigureAwait(false) != all)
+                Log.Warn("HLS", $"{live.Length} request task(s) still running after {ShutdownDrainMs}ms — " +
+                                "continuing shutdown without them");
+            else
+                try { await all.ConfigureAwait(false); }
+                catch (Exception ex) { Log.Warn("HLS", $"A request task ended with {ex.GetType().Name}: {ex.Message}"); }
+        }
+
         Log.Info("HLS", "Playlist server stopped.");
     }
 
@@ -117,7 +142,9 @@ public sealed class HlsServer : IAsyncDisposable
                 break;
             }
 
-            _ = HandleClientAsync(client, ct);
+            Task handler = HandleClientAsync(client, ct);
+            _connectionTasks.TryAdd(handler, 0);
+            _ = handler.ContinueWith(t => _connectionTasks.TryRemove(t, out _), TaskScheduler.Default);
         }
     }
 

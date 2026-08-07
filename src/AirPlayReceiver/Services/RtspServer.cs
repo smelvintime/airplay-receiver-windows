@@ -2,6 +2,7 @@ using AirPlayReceiver.Protocol;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -42,6 +43,13 @@ public sealed class RtspServer : IAsyncDisposable
     /// </summary>
     private const int RefusalLogInterval = 100;
 
+    /// <summary>
+    /// How long <see cref="StopAsync"/> waits for in-flight connection tasks after
+    /// cancelling them. They unblock on the cancellation token, so this is only
+    /// insurance against one wedged in native code; shutdown must not hang on it.
+    /// </summary>
+    private const int ShutdownDrainMs = 2000;
+
     private readonly int  _port;
     private readonly Func<AirPlaySession> _sessionFactory;
     private readonly ReverseChannelRegistry _reverseChannels;
@@ -52,6 +60,10 @@ public sealed class RtspServer : IAsyncDisposable
 
     // Live client connections, so the UI can end the current session on demand.
     private readonly ConcurrentDictionary<TcpClient, byte> _clients = new();
+
+    // The tasks running those connections, so shutdown can wait for them instead
+    // of letting AirPlayService dispose shared state out from under them.
+    private readonly ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
     private long _refusedConnections;
 
@@ -85,7 +97,34 @@ public sealed class RtspServer : IAsyncDisposable
         _listener?.Stop();
         if (_acceptLoop is not null)
             await _acceptLoop.ConfigureAwait(false);
+
+        await DrainConnectionsAsync().ConfigureAwait(false);
         Log.Info("RTSP", "Stopped.");
+    }
+
+    /// <summary>
+    /// Waits for the connection tasks the accept loop spawned. Without this,
+    /// StopAsync returned while sessions were still running and
+    /// AirPlayService.StopAsync disposed shared state underneath them — no
+    /// double-dispose was reachable, but shutdown ordering was left to chance.
+    /// </summary>
+    private async Task DrainConnectionsAsync()
+    {
+        Task[] live = _connectionTasks.Keys.ToArray();
+        if (live.Length == 0) return;
+
+        Task all = Task.WhenAll(live);
+        if (await Task.WhenAny(all, Task.Delay(ShutdownDrainMs)).ConfigureAwait(false) != all)
+        {
+            Log.Warn("RTSP", $"{live.Length} connection task(s) still running after {ShutdownDrainMs}ms — " +
+                             "continuing shutdown without them");
+            return;
+        }
+
+        // HandleClientAsync swallows its own IO errors, but observe the aggregate
+        // anyway so a future change cannot turn one into an unobserved exception.
+        try { await all.ConfigureAwait(false); }
+        catch (Exception ex) { Log.Warn("RTSP", $"A connection task ended with {ex.GetType().Name}: {ex.Message}"); }
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
@@ -140,7 +179,9 @@ public sealed class RtspServer : IAsyncDisposable
             // Each iOS connection gets its own session on a dedicated Task.
             // iOS only opens one at a time for screen mirroring, but we support
             // multiple to be safe (e.g. reconnect before teardown is processed).
-            _ = HandleClientAsync(client, ct);
+            Task handler = HandleClientAsync(client, ct);
+            _connectionTasks.TryAdd(handler, 0);
+            _ = handler.ContinueWith(t => _connectionTasks.TryRemove(t, out _), TaskScheduler.Default);
         }
     }
 
