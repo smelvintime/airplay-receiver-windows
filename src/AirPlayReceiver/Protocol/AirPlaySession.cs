@@ -45,6 +45,10 @@ public sealed class AirPlaySession : IAsyncDisposable
     private bool   _isRecording;
     private string _sessionId = Guid.NewGuid().ToString("N")[..8];
 
+    // True when this connection is the one that handed a URL to the shared video
+    // player, so its teardown (and only its teardown) stops playback.
+    private bool   _startedVideoPlayback;
+
     // ── AirPlay 2 mirroring media state (set up during SETUP) ─────────────────
     private MirrorStreamReceiver? _mirror;        // TCP video stream
     private AudioStreamReceiver?  _audio;         // UDP/RTP AAC-ELD audio (type 96)
@@ -184,12 +188,14 @@ public sealed class AirPlaySession : IAsyncDisposable
     private byte[] HandlePlay(RtspMessage msg)
     {
         // The /play body carries the video URL. It may be a binary plist
-        // ("Content-Location" + "Start-Position") or a small text body
+        // ("Content-Location" + the start-position keys) or a small text body
         // ("Content-Location: <url>\nStart-Position: <pos>"). Parse both and log
         // everything so we can see exactly what iOS sends.
         byte[] body = msg.Body ?? Array.Empty<byte>();
-        string? url = null;
-        double  start = 0;
+        string? url  = null;
+        string? uuid = null;
+        double  startSeconds  = 0;   // "Start-Position-Seconds" — absolute seconds
+        double  startFraction = 0;   // legacy "Start-Position"  — 0..1 of the duration
 
         // Full diagnostic dump: headers (X-Apple-Session-ID etc.) + the entire plist,
         // so we can see whether Content-Location is a direct URL or an HLS
@@ -204,9 +210,18 @@ public sealed class AirPlaySession : IAsyncDisposable
                 var dump = new StringBuilder();
                 DumpPlist(dict, dump, 1);
                 Log.Info("Video", $"/play plist ({body.Length}B):\n{dump}");
-                url = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
-                if (dict.TryGetValue("Start-Position", out var sp))
-                    start = sp switch { double d => d, long l => (double)l, _ => 0.0 };
+
+                url  = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
+                uuid = dict.TryGetValue("uuid", out var uid) ? uid as string : null;
+
+                // Modern iOS (AirPlay/870+) sends BOTH start keys and they mean
+                // different things: "Start-Position-Seconds" is absolute seconds
+                // (a real capture had 218.135603) while the legacy "Start-Position"
+                // is a 0..1 FRACTION of the duration (0.0 in that same capture).
+                // We used to read the legacy key as seconds, so every resume
+                // restarted the item from 0:00.
+                if (dict.TryGetValue("Start-Position-Seconds", out var sps)) startSeconds  = PlistDouble(sps);
+                if (dict.TryGetValue("Start-Position",         out var sp))  startFraction = PlistDouble(sp);
             }
             else
             {
@@ -217,8 +232,14 @@ public sealed class AirPlaySession : IAsyncDisposable
                     string l = line.Trim();
                     if (l.StartsWith("Content-Location:", StringComparison.OrdinalIgnoreCase))
                         url = l["Content-Location:".Length..].Trim();
+                    else if (l.StartsWith("Start-Position-Seconds:", StringComparison.OrdinalIgnoreCase))
+                        double.TryParse(l["Start-Position-Seconds:".Length..].Trim(),
+                                        System.Globalization.CultureInfo.InvariantCulture, out startSeconds);
                     else if (l.StartsWith("Start-Position:", StringComparison.OrdinalIgnoreCase))
-                        double.TryParse(l["Start-Position:".Length..].Trim(), out start);
+                        double.TryParse(l["Start-Position:".Length..].Trim(),
+                                        System.Globalization.CultureInfo.InvariantCulture, out startFraction);
+                    else if (l.StartsWith("uuid:", StringComparison.OrdinalIgnoreCase))
+                        uuid = l["uuid:".Length..].Trim();
                 }
             }
         }
@@ -228,12 +249,64 @@ public sealed class AirPlaySession : IAsyncDisposable
         }
 
         if (!string.IsNullOrEmpty(url))
-            _videoPlayer.Play(url!, start);
+        {
+            Log.Info("Video", startSeconds > 0
+                ? $"/play start from Start-Position-Seconds = {Inv(startSeconds)}s"
+                : startFraction > 0
+                    ? $"/play start from legacy Start-Position fraction {Inv(startFraction)} " +
+                      "(resolved against the duration once the demuxer reports it)"
+                    : "/play start from the beginning");
+
+            StartVideoPlayback(url!, startSeconds, startFraction, uuid, msg);
+        }
         else
+        {
             Log.Warn("Video", $"/play had no Content-Location (body={body.Length}B)");
+        }
 
         return Ok(msg);
     }
+
+    /// <summary>
+    /// Hands a URL to the shared player and records that <i>this</i> session owns
+    /// the playback. Ownership matters at teardown: AirPlay Video drives transport
+    /// over many short-lived control connections, and only the one that started
+    /// playback may stop it when it drops (see <see cref="StopStreamAsync"/>).
+    /// </summary>
+    private void StartVideoPlayback(string url, double startSeconds, double startFraction, string? uuid, RtspMessage msg)
+    {
+        _videoPlayer.PlayRequestHeaders = ForwardableHeaders(msg);
+        _startedVideoPlayback = true;
+        _videoPlayer.Play(url, startSeconds, startFraction, uuid);
+    }
+
+    /// <summary>
+    /// Cookie/Referer from the control request, CRLF-joined for FFmpeg's "headers"
+    /// option. Session-scoped CDN URLs 403 without them.
+    /// </summary>
+    private static string? ForwardableHeaders(RtspMessage msg)
+    {
+        var lines = new List<string>();
+        foreach (string name in new[] { "Cookie", "Referer" })
+            if (msg.Headers.TryGetValue(name, out string? v) && !string.IsNullOrWhiteSpace(v))
+                lines.Add($"{name}: {v}");
+        return lines.Count == 0 ? null : string.Join("\r\n", lines);
+    }
+
+    /// <summary>Plist reals arrive as double, ints as long — normalise both.</summary>
+    private static double PlistDouble(object? v) => v switch
+    {
+        double d => d,
+        long   l => l,
+        int    i => i,
+        string s when double.TryParse(s, System.Globalization.NumberStyles.Float,
+                                      System.Globalization.CultureInfo.InvariantCulture, out double p) => p,
+        _ => 0.0,
+    };
+
+    /// <summary>Invariant-culture number text. iOS cannot parse "12,5".</summary>
+    private static string Inv(double v)
+        => v.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
 
     private byte[] HandleRate(RtspMessage msg)
     {
@@ -891,6 +964,22 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private async Task StopStreamAsync()
     {
+        // AirPlay Video (URL playback) lives on the shared player, not on this
+        // session — but when the phone leaves the network it just drops the socket
+        // instead of sending POST /stop, and FFmpeg would then loop forever on a
+        // stream nobody is watching. Only the session that actually started
+        // playback may end it: video-out drives transport over many short-lived
+        // control connections, and any of the others closing means nothing.
+        if (_startedVideoPlayback)
+        {
+            _startedVideoPlayback = false;
+            if (_videoPlayer.IsActive)
+            {
+                Log.Info("Video", "session teardown — stopping URL playback");
+                _videoPlayer.Stop();
+            }
+        }
+
         if (_isRecording)
         {
             _isRecording = false;
