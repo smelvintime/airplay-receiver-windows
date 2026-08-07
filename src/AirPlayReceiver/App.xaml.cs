@@ -15,6 +15,10 @@ public partial class App : Application
 
     public App()
     {
+        // Open the per-run log file first so every later failure — including one
+        // in InitializeComponent — is captured in a Release build.
+        Log.Init();
+
         this.InitializeComponent();
 
         // Catch and log any unhandled exception so a crash leaves a trace even after
@@ -47,7 +51,7 @@ public partial class App : Application
     private static void LogCrash(string source, Exception? ex)
     {
         string msg = $"[Crash:{source}] {DateTime.Now:O}\n{ex}\n";
-        System.Diagnostics.Debug.WriteLine(msg);
+        Log.Error("Crash", $"({source}) unhandled exception", ex);
         try
         {
             System.IO.File.AppendAllText(
@@ -86,7 +90,7 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[App] AirPlay service failed to start: {ex}");
+            Log.Error("App", "AirPlay service failed to start", ex);
         }
 
     }
