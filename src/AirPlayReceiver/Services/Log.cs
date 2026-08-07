@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -16,15 +17,41 @@ namespace AirPlayReceiver.Services;
 ///   • AutoFlush: a crash right after a write still leaves the line on disk.
 ///   • Logging must never crash the app — all IO errors are swallowed; if the
 ///     file can't be opened, writes silently fall back to Debug output only.
-///   • Retention: on startup, log files beyond the 10 most recent are deleted.
+///   • Retention: on startup, log files beyond the 10 most recent are deleted,
+///     and one run's file stops growing at MaxLogFileBytes.
+///   • Every message is sanitised: attacker-supplied header and plist values are
+///     logged verbatim by design, so control characters are neutralised here.
 /// </summary>
 public static class Log
 {
     private const int MaxLogFiles = 10;
 
+    /// <summary>
+    /// Ceiling on one run's log file.
+    ///
+    /// Retention was count-based only, which bounds how many files exist but not
+    /// how large the current one gets — and header and plist values arrive from an
+    /// unauthenticated LAN sender, are logged verbatim on purpose, and are not
+    /// rate-limited. Without this, filling the disk is a request loop. At the cap
+    /// we say so once and stop writing to the file; Debug output continues.
+    /// </summary>
+    private const long MaxLogFileBytes = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// What a newline inside a message is replaced with.
+    ///
+    /// Multi-line dumps (plists, header blocks, stack traces) are the point of
+    /// this log, so newlines are re-indented rather than escaped away — but a
+    /// continuation line now starts with this marker instead of at column 0, so
+    /// nothing injected into a value can be mistaken for a real
+    /// "HH:mm:ss.fff [level] [tag]" line.
+    /// </summary>
+    private const string ContinuationPrefix = "\n         | ";
+
     private static readonly object Sync = new();
     private static StreamWriter? _writer;
     private static bool _initialized;
+    private static bool _sizeCapReported;
 
     /// <summary>Full path of this run's log file, or null when file logging is unavailable.</summary>
     public static string? CurrentLogFile { get; private set; }
@@ -91,16 +118,80 @@ public static class Log
         {
             if (!_initialized) Init();
 
-            string line = $"{DateTime.Now:HH:mm:ss.fff} [{level}] [{tag}] {msg}";
+            // Sanitised here, once, rather than at the call sites: every call site
+            // that logs a header or plist value is one that can be forgotten, and
+            // LogVideoHeaders/DumpPlist log network input verbatim by design.
+            string line = $"{DateTime.Now:HH:mm:ss.fff} [{level}] [{tag}] {Sanitize(msg)}";
             System.Diagnostics.Debug.WriteLine(line);
 
             lock (Sync)
             {
-                try { _writer?.WriteLine(line); }
+                try
+                {
+                    if (_writer is null) return;
+
+                    _writer.WriteLine(line);
+
+                    // AutoFlush is on, so the stream length is exact after the write.
+                    if (_writer.BaseStream.Length >= MaxLogFileBytes && !_sizeCapReported)
+                    {
+                        _sizeCapReported = true;
+                        _writer.WriteLine($"{DateTime.Now:HH:mm:ss.fff} [error] [log] This file reached the " +
+                                          $"{MaxLogFileBytes} byte cap — no further lines will be written to disk " +
+                                          "this run (Debug output continues).");
+                        _writer.Dispose();
+                        _writer = null;
+                    }
+                }
                 catch { /* logging must never crash the app */ }
             }
         }
         catch { /* formatting/init failure — logging must never crash the app */ }
+    }
+
+    /// <summary>
+    /// Neutralises the control characters an attacker-supplied value could use to
+    /// forge log lines or corrupt a terminal.
+    ///
+    /// Newlines survive as indented continuations (see
+    /// <see cref="ContinuationPrefix"/>) because multi-line dumps are the point of
+    /// this log; a lone CR and every other C0/C1 control becomes a visible
+    /// <c>\xNN</c> escape, so nothing is silently dropped either. Tab is left
+    /// alone — it only ever comes from our own formatting.
+    /// </summary>
+    private static string Sanitize(string msg)
+    {
+        bool needsWork = false;
+        foreach (char c in msg)
+        {
+            if (c != '\t' && char.IsControl(c)) { needsWork = true; break; }
+        }
+        if (!needsWork) return msg;
+
+        var sb = new StringBuilder(msg.Length + 16);
+        for (int i = 0; i < msg.Length; i++)
+        {
+            char c = msg[i];
+            if (c == '\n')
+            {
+                sb.Append(ContinuationPrefix);
+            }
+            else if (c == '\r')
+            {
+                // CRLF collapses to one continuation; a lone CR is shown.
+                if (i + 1 < msg.Length && msg[i + 1] == '\n') continue;
+                sb.Append("\\r");
+            }
+            else if (c != '\t' && char.IsControl(c))
+            {
+                sb.Append("\\x").Append(((int)c).ToString("X2", CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
     }
 
     /// <summary>
