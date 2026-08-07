@@ -35,3 +35,6 @@ Desktop.ini
 # Logs
 *.log
 publish/
+
+# Agent worktrees
+.claude/worktrees/
