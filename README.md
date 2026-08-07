@@ -10,8 +10,14 @@ iPad can mirror to it from Control Center.
 
 ## Download and run
 
+> **⚠️ Skip the old 1.0.0 and 1.1.0 releases.** They contain a stale,
+> hand-built `AirPlayReceiverSetup.exe` that shipped without the video decoder
+> DLLs — it installs fine but mirrors only a black screen. Download
+> `AirPlayReceiver-win-x64.zip` from the **newest** release instead.
+
 1. Go to the [**Releases** page](../../releases) and download
-   `AirPlayReceiver-win-x64.zip` from the newest release.
+   `AirPlayReceiver-win-x64.zip` from the newest release. (Ignore any release
+   that only offers `AirPlayReceiverSetup.exe` — see the warning above.)
 2. Right-click the zip → **Extract All**.
 3. Open the extracted folder and run **`AirPlayReceiver.exe`**.
 4. Windows SmartScreen will warn that the app is unrecognized (it isn't code
@@ -53,8 +59,8 @@ together.
 
 ## Releasing
 
-Pushing a tag that starts with `v` builds the app and publishes a release with
-the zip attached:
+Pushing a version tag — either `v1.2.3` or bare `1.2.3` — builds the app and
+publishes a release with the zip attached:
 
 ```
 git tag v0.1.0
