@@ -15,17 +15,28 @@ Install **Visual Studio 2022 (17.8 or newer)** with these workloads/components:
 
 ## 2. (Optional for first launch) Add the FFmpeg DLLs
 
-Video decoding needs the native FFmpeg 6.x DLLs. They are intentionally **not**
-committed (see `.gitignore`). Without them the app still launches and is
+Video decoding needs the native FFmpeg **7.1** DLLs. They are intentionally
+**not** committed (see `.gitignore`). Without them the app still launches and is
 discoverable — it just can't decode video and shows a notice in the HUD.
 
 To enable decoding:
 
-1. Download `ffmpeg-n6.x-win64-gpl-shared` from
-   <https://github.com/BtbN/FFmpeg-Builds/releases>.
-2. Copy these DLLs into `src/AirPlayReceiver/native/x64/`:
+1. Download an `ffmpeg-n7.1.x-...-win64-gpl-shared-7.1` zip from
+   <https://github.com/BtbN/FFmpeg-Builds/releases> (any release whose asset
+   name starts with `ffmpeg-n7.1`).
+2. Copy these DLLs from the zip's `bin/` folder into
+   `src/AirPlayReceiver/native/x64/`:
    `avcodec-61.dll`, `avdevice-61.dll`, `avfilter-10.dll`, `avformat-61.dll`,
    `avutil-59.dll`, `postproc-58.dll`, `swresample-5.dll`, `swscale-8.dll`.
+
+> **Version matters.** The project pins `FFmpeg.AutoGen 7.1.1`, which binds
+> **only** FFmpeg 7.x natives. FFmpeg **8.x will NOT work** — its DLLs are
+> named `avcodec-62.dll` etc. and the bindings won't resolve them (no video,
+> no build error to warn you). Likewise 6.x and older won't work.
+>
+> At build time the DLLs are copied into the output preserving their relative
+> path: they land in `native\x64\` **next to** `AirPlayReceiver.exe`, and the
+> app loads them from there.
 
 ## 3. Open and build
 
@@ -62,6 +73,6 @@ networks**, since the receiver needs:
 | Symptom | Fix |
 |---------|-----|
 | Build error: platform `Any CPU` not supported | Switch the platform dropdown to **x64**. |
-| `DllNotFoundException` for `avcodec-61` at runtime | Add the FFmpeg DLLs (step 2); they must sit in `native/x64/` next to the build output. |
+| `DllNotFoundException` for `avcodec-61` at runtime | Add the FFmpeg DLLs (step 2); they must end up in `native\x64\` next to the exe in the build output. Also check you grabbed a 7.1 build — 8.x DLLs (`avcodec-62`) won't resolve. |
 | Device doesn't appear in iPhone Screen Mirroring | Confirm both devices are on the same subnet and the firewall prompt was allowed for Private networks. |
 | App closes immediately | Run with the debugger (F5) and check the Output window for the startup exception. |
