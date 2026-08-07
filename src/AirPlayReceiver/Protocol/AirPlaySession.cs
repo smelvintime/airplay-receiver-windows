@@ -323,15 +323,32 @@ public sealed class AirPlaySession : IAsyncDisposable
             BinaryPlist.Write(info), protocol: msg.Version);
     }
 
+    /// <summary>
+    /// GET /server-info — a capability gate separate from both the mDNS TXT record
+    /// and GET /info. iOS reads all three.
+    ///
+    /// The features value here is deliberately NOT the 64-bit mDNS mask. UxPlay
+    /// (lib/raop_handlers.h, raop_handler_serverinfo) and apsdk both hardcode
+    /// 0x27F — bits 0-6 plus bit 9 — no matter what they advertise over mDNS, and
+    /// both are known-working receivers. Reporting the full mirroring mask here
+    /// claims AirPlay 2 capabilities this endpoint's consumers don't expect.
+    ///
+    /// UxPlay serves this as text/x-apple-plist+xml. We have no XML plist writer
+    /// yet (Protocol/XmlPlist.cs is in flight), so this keeps the binary plist
+    /// encoding already used everywhere else in this file.
+    /// </summary>
     private byte[] HandleServerInfo(RtspMessage msg)
     {
         var info = new Dictionary<string, object?>
         {
-            ["deviceid"]  = _deviceInfo.DeviceId,
-            ["features"]  = _deviceInfo.Features,
-            ["model"]     = _deviceInfo.Model,
-            ["protovers"] = "1.0",
-            ["srcvers"]   = _deviceInfo.SourceVersion,
+            ["deviceid"]       = _deviceInfo.DeviceId,
+            ["macAddress"]     = _deviceInfo.DeviceId,
+            ["features"]       = (long)0x27F,
+            ["model"]          = _deviceInfo.Model,
+            ["osBuildVersion"] = "12B435",
+            ["protovers"]      = "1.0",
+            ["srcvers"]        = _deviceInfo.SourceVersion,
+            ["vv"]             = (long)2,
         };
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
             new Dictionary<string, string> { ["Content-Type"] = "application/x-apple-binary-plist" },
