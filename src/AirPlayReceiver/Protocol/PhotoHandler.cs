@@ -77,12 +77,13 @@ public sealed class PhotoHandler
     /// <summary>The asset cache, exposed for teardown and for harness assertions.</summary>
     public PhotoCache Cache => _cache;
 
-    // Set by the first photo request, cleared by EndSession. Drives the
-    // photo/stopped event: iOS considers the session open from the moment it
-    // pushed an asset, whether or not our decode of it succeeded.
+    // Set by the first photo request that carried an asset — a display OR a
+    // cacheOnly preload — and cleared by EndSession. Drives the photo/stopped
+    // event: iOS considers the session open from the moment it pushed an asset,
+    // whether or not we displayed it or our decode of it succeeded.
     private int _sessionOpen;
 
-    /// <summary>True between the first photo of a session and its teardown.</summary>
+    /// <summary>True between the first asset of a session and its teardown.</summary>
     public bool SessionActive => Volatile.Read(ref _sessionOpen) != 0;
 
     public long Requests           => Interlocked.Read(ref _requests);
@@ -185,6 +186,13 @@ public sealed class PhotoHandler
             Log.Warn("Photo", $"{ActionCacheOnly} key={assetKey} with an empty body — nothing to cache; answering 400");
             return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
         }
+
+        // A preload opens the session too. TEARDOWN only runs EndSession when
+        // SessionActive is set, so a phone that preloads and then disconnects
+        // without ever displaying (the user backing out of an album) would
+        // otherwise leave the whole byte budget — up to 192 MB — and the keys of
+        // a phone that has gone away resident for the rest of the app's life.
+        Interlocked.Exchange(ref _sessionOpen, 1);
 
         _cache.Store(assetKey, body);
         Interlocked.Increment(ref _cachedOnly);

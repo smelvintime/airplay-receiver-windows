@@ -264,6 +264,31 @@ internal static class Program
             Check("the byte total counts that asset once", rig.Handler.Cache.Bytes == photoB.Length,
                   $"cache holds {rig.Handler.Cache.Bytes}B, JPEG is {photoB.Length}B");
         }
+
+        // ── Scenario 11: a preload-only session still tears down ──────────────
+        // TEARDOWN only calls EndSession when the handler reports a session open.
+        // A phone that preloads and then backs out of the album without ever
+        // displaying anything would otherwise leave the entire byte budget — up
+        // to 192 MB — plus the asset keys of a phone that has gone away, resident
+        // for the rest of the app's life.
+        using (var rig = new Rig())
+        {
+            rig.Put("/photo", photoA, key: "PRELOAD-1", action: PhotoHandler.ActionCacheOnly);
+            rig.Put("/photo", photoB, key: "PRELOAD-2", action: PhotoHandler.ActionCacheOnly);
+
+            Check("cacheOnly alone opens the session", rig.Handler.SessionActive, "SessionActive was false");
+            Check("cacheOnly alone displays nothing", rig.Sink.Frames.Count == 0,
+                  $"sink saw {rig.Sink.Frames.Count} frame(s)");
+            Check("both preloads are held", rig.Handler.Cache.Count == 2,
+                  $"cache holds {rig.Handler.Cache.Count}");
+
+            rig.Handler.EndSession();
+            Check("teardown released the preloaded bytes",
+                  rig.Handler.Cache.Count == 0 && rig.Handler.Cache.Bytes == 0,
+                  $"cache holds {rig.Handler.Cache.Count} entry/entries, {rig.Handler.Cache.Bytes}B");
+            Check("preload-only session is no longer active", !rig.Handler.SessionActive,
+                  "SessionActive was true");
+        }
     }
 
     /// <summary>
