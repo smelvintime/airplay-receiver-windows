@@ -25,6 +25,7 @@ public sealed class RtspServer : IAsyncDisposable
 {
     private readonly int  _port;
     private readonly Func<AirPlaySession> _sessionFactory;
+    private readonly ReverseChannelRegistry _reverseChannels;
 
     private TcpListener?          _listener;
     private CancellationTokenSource? _cts;
@@ -36,10 +37,11 @@ public sealed class RtspServer : IAsyncDisposable
     public event Action<AirPlaySession>? SessionStarted;
     public event Action<AirPlaySession>? SessionEnded;
 
-    public RtspServer(int port, Func<AirPlaySession> sessionFactory)
+    public RtspServer(int port, Func<AirPlaySession> sessionFactory, ReverseChannelRegistry reverseChannels)
     {
-        _port           = port;
-        _sessionFactory = sessionFactory;
+        _port            = port;
+        _sessionFactory  = sessionFactory;
+        _reverseChannels = reverseChannels;
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -115,22 +117,53 @@ public sealed class RtspServer : IAsyncDisposable
         _clients.TryAdd(client, 0);
         SessionStarted?.Invoke(session);
 
+        NetworkStream? stream = null;
+        bool faulted = false;
+
         try
         {
-            using var stream = client.GetStream();
+            stream = client.GetStream();
             await session.RunAsync(stream, ct);
         }
         catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or ObjectDisposedException)
         {
             // ObjectDisposedException is expected when CloseActiveConnections() drops us.
+            faulted = true;
             Log.Info("RTSP", $"Session ended ({remote}): {ex.Message}");
         }
         finally
         {
             _clients.TryRemove(client, out _);
-            client.Dispose();
+
+            // Socket-ownership handoff: a connection the session upgraded to
+            // reverse HTTP (PTTH) must survive — after the 101 it is the receiver's
+            // only way to send requests TO the phone. Disposing it here (what this
+            // method used to do unconditionally) is what made app-initiated video
+            // and photo events impossible.
+            if (!faulted && stream is not null && session.ReverseUpgrade is { } upgrade)
+            {
+                var channel = new ReverseChannel(upgrade.SessionId, upgrade.Purpose, stream, client);
+                if (_reverseChannels.Register(channel))
+                {
+                    Log.Info("Reverse", $"Socket ownership transferred to registry: {remote} " +
+                                        $"session={upgrade.SessionId} purpose={upgrade.Purpose}");
+                }
+                else
+                {
+                    // Refused (duplicate event channel / shutting down): Dispose
+                    // closes the stream and the TcpClient we handed it.
+                    Log.Warn("Reverse", $"Registry refused the channel for {remote} — closing socket");
+                    channel.Dispose();
+                }
+            }
+            else
+            {
+                stream?.Dispose();
+                client.Dispose();
+                Log.Info("RTSP", $"Closed {remote}");
+            }
+
             SessionEnded?.Invoke(session);
-            Log.Info("RTSP", $"Closed {remote}");
         }
     }
 }

@@ -29,6 +29,17 @@ public sealed class AirPlayService : IAsyncDisposable
     // Constructed in StartAsync once the presenter it renders to exists.
     private AirPlayVideoPlayer? _videoPlayer;
 
+    // Shared reverse (PTTH) channels, referenced by every session. Lives for the
+    // whole app run: an upgraded socket outlives the RTSP connection it arrived on.
+    private readonly ReverseChannelRegistry _reverseChannels = new();
+
+    /// <summary>
+    /// The receiver→phone reverse-HTTP channels, keyed by X-Apple-Session-ID.
+    /// Exposed so app-initiated video/photo features can push /event and FCUP
+    /// requests to the phone.
+    /// </summary>
+    public ReverseChannelRegistry ReverseChannels => _reverseChannels;
+
     // Must match the mDNS "features" TXT value (MdnsService.AirPlayFeatures):
     // 0x5A7FFFF7,0x1E → (0x1E << 32) | 0x5A7FFFF7. Word 2 = 0x1E keeps the device
     // reconnectable in the iOS picker (word 2 = 0x0 made it vanish after a session).
@@ -108,7 +119,7 @@ public sealed class AirPlayService : IAsyncDisposable
         }
 
         // ── 3. RTSP server ────────────────────────────────────────────────────
-        _rtsp = new RtspServer(port: 7000, sessionFactory: CreateSession);
+        _rtsp = new RtspServer(port: 7000, sessionFactory: CreateSession, reverseChannels: _reverseChannels);
         _rtsp.SessionStarted += OnSessionStarted;
         _rtsp.SessionEnded   += OnSessionEnded;
         await _rtsp.StartAsync(ct);
@@ -126,6 +137,10 @@ public sealed class AirPlayService : IAsyncDisposable
         if (_rtsp    is not null) await _rtsp.StopAsync();
         if (_decoder is not null) await _decoder.StopAsync();
 
+        // Reverse channels own sockets the RTSP server handed over, so nothing
+        // else closes them.
+        _reverseChannels.Dispose();
+
         _videoPlayer?.Dispose();
         _presenter?.Dispose();
         _decoder?.Dispose();
@@ -136,14 +151,20 @@ public sealed class AirPlayService : IAsyncDisposable
     public async ValueTask DisposeAsync() => await StopAsync();
 
     /// <summary>Ends the current AirPlay session (disconnects the phone) but keeps advertising.</summary>
-    public void EndActiveSessions() => _rtsp?.CloseActiveConnections();
+    public void EndActiveSessions()
+    {
+        _rtsp?.CloseActiveConnections();
+        // Upgraded reverse sockets are no longer tracked by the RTSP server, so
+        // they have to be closed here too or the phone keeps a half-live session.
+        _reverseChannels.CloseAll();
+    }
 
     // ── Session factory ───────────────────────────────────────────────────────
 
     private AirPlaySession CreateSession()
     {
         var pairing = new PairingHandler(_identity!);
-        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!);
+        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!, _reverseChannels);
 
         // Mirroring frames arrive already upright, so clear any rotation left over
         // from a previous AirPlay Video session before this stream renders.

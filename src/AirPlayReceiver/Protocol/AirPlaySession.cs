@@ -35,6 +35,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     private readonly DeviceInfo        _deviceInfo;
     private readonly VideoDecoder?     _decoder;       // mirror video sink (null if FFmpeg absent)
     private readonly AirPlayVideoPlayer _videoPlayer;  // shared AirPlay Video (URL playback) state
+    private readonly ReverseChannelRegistry _reverseChannels; // shared receiver→phone (PTTH) channels
 
     // Callbacks into the UI layer
     public event Action?         StreamStarted;
@@ -44,6 +45,24 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private bool   _isRecording;
     private string _sessionId = Guid.NewGuid().ToString("N")[..8];
+
+    // The GUID iOS puts in X-Apple-Session-ID on every connection of one AirPlay
+    // session. It correlates this control connection with the separate TCP
+    // connection carrying the reverse (PTTH) channel, so teardown can close it.
+    private string? _appleSessionId;
+
+    // True once iOS sent TEARDOWN on this connection — the one unambiguous
+    // "session is over" signal, and the only one that closes reverse channels.
+    private bool _teardownReceived;
+
+    /// <summary>
+    /// Set by <see cref="HandleReverse"/> once we answered 101 Switching
+    /// Protocols: this connection is no longer an RTSP request stream, it is a
+    /// receiver→phone reverse channel. <see cref="Services.RtspServer"/> reads
+    /// this after <see cref="RunAsync"/> returns and hands the socket to the
+    /// <see cref="ReverseChannelRegistry"/> instead of disposing it.
+    /// </summary>
+    public (string SessionId, string Purpose)? ReverseUpgrade { get; private set; }
 
     // ── AirPlay 2 mirroring media state (set up during SETUP) ─────────────────
     private MirrorStreamReceiver? _mirror;        // TCP video stream
@@ -59,13 +78,15 @@ public sealed class AirPlaySession : IAsyncDisposable
     // ── Construction ──────────────────────────────────────────────────────────
 
     public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo,
-                          VideoDecoder? decoder, AirPlayVideoPlayer videoPlayer)
+                          VideoDecoder? decoder, AirPlayVideoPlayer videoPlayer,
+                          ReverseChannelRegistry reverseChannels)
     {
-        _rtpReceiver = rtpReceiver;
-        _pairing     = pairing;
-        _deviceInfo  = deviceInfo;
-        _decoder     = decoder;
-        _videoPlayer = videoPlayer;
+        _rtpReceiver     = rtpReceiver;
+        _pairing         = pairing;
+        _deviceInfo      = deviceInfo;
+        _decoder         = decoder;
+        _videoPlayer     = videoPlayer;
+        _reverseChannels = reverseChannels;
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -85,6 +106,14 @@ public sealed class AirPlaySession : IAsyncDisposable
 
                 Log.Info("RTSP→", $"{msg}");
 
+                // Remember the AirPlay session GUID (present on every video-out
+                // request) so teardown can close this session's reverse channels.
+                if (msg.Headers.TryGetValue(ReverseChannel.SessionIdHeader, out string? appleSid) &&
+                    !string.IsNullOrEmpty(appleSid))
+                {
+                    _appleSessionId = appleSid;
+                }
+
                 byte[] response = msg.Method switch
                 {
                     "OPTIONS"       => HandleOptions(msg),
@@ -103,7 +132,22 @@ public sealed class AirPlaySession : IAsyncDisposable
                 Log.Info("RTSP←", $"{response.Length}B");
                 await stream.WriteAsync(response, ct);
 
-                if (msg.Method == "TEARDOWN") break;
+                if (msg.Method == "TEARDOWN")
+                {
+                    _teardownReceived = true;
+                    break;
+                }
+
+                // The 101 for /reverse inverted this socket's roles: from here on
+                // it carries our requests out and the phone's responses back in.
+                // Stop parsing it as an RTSP request stream (UxPlay httpd.c does
+                // the same) and let RtspServer hand the socket to the registry.
+                if (ReverseUpgrade is { } upgrade)
+                {
+                    Log.Info("Reverse", $"Upgrade accepted — leaving RTSP loop for session={upgrade.SessionId} " +
+                                        $"purpose={upgrade.Purpose}; socket ownership passes to the registry");
+                    break;
+                }
             }
         }
         finally
@@ -114,6 +158,17 @@ public sealed class AirPlaySession : IAsyncDisposable
             // rebind and reconnect breaks — and the presenter/overlay never reset,
             // leaving the last frame frozen instead of returning to idle.
             await StopStreamAsync();
+
+            // Close this AirPlay session's reverse channels on an explicit
+            // TEARDOWN only. A dropped control connection is not enough: iOS uses
+            // several connections per session (all carrying the same
+            // X-Apple-Session-ID), so closing on any of them would kill the event
+            // channel mid-playback. When the phone really goes away it closes the
+            // reverse socket too, and the channel's drain loop unregisters itself
+            // on EOF. Never from the upgraded connection — its session ends by
+            // design, and it must not tear down the channel it just handed over.
+            if (_teardownReceived && ReverseUpgrade is null && _appleSessionId is not null)
+                _reverseChannels.RemoveAllForSession(_appleSessionId);
         }
     }
 
@@ -264,11 +319,51 @@ public sealed class AirPlaySession : IAsyncDisposable
         return Ok(msg);
     }
 
-    /// <summary>The reverse-HTTP event channel: ack with a protocol switch and keep the connection open.</summary>
+    /// <summary>
+    /// The reverse-HTTP (PTTH) handshake. iOS opens a dedicated TCP connection
+    /// and sends, before /play:
+    /// <code>
+    /// POST /reverse HTTP/1.1
+    /// Connection: Upgrade
+    /// Upgrade: PTTH/1.0
+    /// X-Apple-Purpose: event          (or "slideshow")
+    /// X-Apple-Session-ID: &lt;GUID&gt;
+    /// </code>
+    /// We answer 101 and record the upgrade; <see cref="RunAsync"/> then leaves
+    /// the RTSP loop and <see cref="Services.RtspServer"/> hands the live socket
+    /// to <see cref="ReverseChannelRegistry"/>, which owns it from then on.
+    /// </summary>
     private byte[] HandleReverse(RtspMessage msg)
     {
-        Log.Info("Video", "/reverse — opening PTTH event channel");
         LogVideoHeaders(msg);
+
+        string sessionId = msg.Headers.TryGetValue(ReverseChannel.SessionIdHeader, out string? sid) ? sid.Trim() : string.Empty;
+        string purpose   = msg.Headers.TryGetValue(ReverseChannel.PurposeHeader, out string? p) && !string.IsNullOrWhiteSpace(p)
+                         ? p.Trim()
+                         : ReverseChannel.PurposeEvent;
+
+        if (string.IsNullOrEmpty(sessionId))
+        {
+            // Without the GUID there is no way to correlate this socket with the
+            // /play connection, so the channel would be unreachable. Refuse it.
+            Log.Warn("Reverse", $"/reverse without {ReverseChannel.SessionIdHeader} — cannot correlate, refusing with 400");
+            return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
+        }
+
+        // One event channel per session (UxPlay answers a second one with 421);
+        // a Photos slideshow legitimately opens three "slideshow" channels.
+        if (string.Equals(purpose, ReverseChannel.PurposeEvent, StringComparison.OrdinalIgnoreCase) &&
+            _reverseChannels.HasChannel(sessionId, ReverseChannel.PurposeEvent))
+        {
+            Log.Warn("Reverse", $"/reverse purpose=event but session={sessionId} already has one — replying 421");
+            return RtspMessage.BuildResponse(421, "Misdirected Request", msg.CSeq, protocol: msg.Version);
+        }
+
+        Log.Info("Reverse", $"/reverse upgrade accepted: session={sessionId} purpose={purpose} " +
+                            $"(upgrade='{(msg.Headers.TryGetValue("Upgrade", out string? u) ? u : "?")}')");
+
+        ReverseUpgrade = (sessionId, purpose);
+
         var headers = new Dictionary<string, string>
         {
             ["Upgrade"]    = "PTTH/1.0",
