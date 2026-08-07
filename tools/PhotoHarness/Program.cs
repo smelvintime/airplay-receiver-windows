@@ -311,6 +311,35 @@ internal static class Program
             Check("downscaled full-range white (255) → limited-range 235", Math.Abs(white - 235) <= 2,
                   $"NV12 luma is {white}");
         }
+
+        // ── Scenario 13: grayscale photos get the range conversion too ────────
+        // A black-and-white photo is a single-component JPEG and decodes to
+        // GRAY8, which has no YUVJ twin for AsFullRangeFormat to map it to. That
+        // is safe only because libswscale classifies every GRAY* format as
+        // full-range on its own — so assert the luma, on both branches, instead
+        // of trusting that to survive the next FFmpeg upgrade.
+        using (var rig = new Rig())
+        {
+            var r = rig.Put("/photo", MakeGrayJpeg(64, 64, luma: 0), key: "GRAY-BLACK");
+            Check("grayscale photo → 200 OK", r.Status == 200, $"got {r.Status} {r.Reason}");
+            Check("grayscale photo reached the display path", rig.Sink.Frames is [(64, 64)],
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            int black = rig.Sink.CenterLuma;
+            Check("grayscale black (0) → limited-range 16", Math.Abs(black - 16) <= 2,
+                  $"NV12 luma is {black}");
+
+            rig.Put("/photo", MakeGrayJpeg(64, 64, luma: 255), key: "GRAY-WHITE");
+            int white = rig.Sink.CenterLuma;
+            Check("grayscale white (255) → limited-range 235", Math.Abs(white - 235) <= 2,
+                  $"NV12 luma is {white}");
+
+            rig.Put("/photo", MakeGrayJpeg(4096, 2304, luma: 0), key: "GRAY-BLACK-4K");
+            Check("oversized grayscale took the downscale branch", rig.Sink.Frames[^1] == (3840, 2160),
+                  $"sink saw {Describe(rig.Sink.Frames)}");
+            int scaledBlack = rig.Sink.CenterLuma;
+            Check("downscaled grayscale black (0) → limited-range 16", Math.Abs(scaledBlack - 16) <= 2,
+                  $"NV12 luma is {scaledBlack}");
+        }
     }
 
     /// <summary>
@@ -606,6 +635,131 @@ internal static class Program
     /// <summary>A flat-luma JPEG (neutral chroma), for asserting the colour-range conversion.</summary>
     private static byte[] MakeFlatJpeg(int width, int height, byte luma)
         => MakeJpeg(width, height, seed: 0, flatLuma: luma);
+
+    /// <summary>
+    /// A baseline <b>single-component</b> JPEG of a flat luma value — the shape a
+    /// black-and-white photo arrives in, and the one FFmpeg decodes to
+    /// <c>AV_PIX_FMT_GRAY8</c> rather than to any YUV(J) format. That format has
+    /// no YUVJ twin for <c>PhotoDecoder.AsFullRangeFormat</c> to map it to, so it
+    /// is the case where the colour-range handling has to hold up unaided.
+    ///
+    /// Hand-assembled because no JPEG encoder in the bundled FFmpeg build will
+    /// emit one: mjpeg and ljpeg both reject <c>gray</c> and list only the
+    /// three-component formats. The bitstream is trivial for a flat image — with
+    /// an all-ones quantisation table every block is one DC coefficient,
+    /// 8·(luma−128), which the IDCT inverts exactly — followed by end-of-block,
+    /// so this is a little entropy coding rather than a JPEG encoder.
+    /// </summary>
+    private static byte[] MakeGrayJpeg(int width, int height, byte luma)
+    {
+        if (width % 8 != 0 || height % 8 != 0)
+            throw new ArgumentException("grayscale test JPEGs are built out of whole 8x8 blocks");
+
+        var jpeg = new List<byte>(1024);
+        void Marker(byte code) { jpeg.Add(0xFF); jpeg.Add(code); }
+        void Length(int payload) { jpeg.Add((byte)((payload + 2) >> 8)); jpeg.Add((byte)((payload + 2) & 0xFF)); }
+
+        Marker(0xD8);                                    // SOI
+
+        Marker(0xDB); Length(65); jpeg.Add(0x00);        // DQT, 8-bit, table 0
+        for (int i = 0; i < 64; i++) jpeg.Add(1);        // all ones: the DC survives exactly
+
+        Marker(0xC0); Length(9);                         // SOF0, baseline
+        jpeg.Add(8);
+        jpeg.Add((byte)(height >> 8)); jpeg.Add((byte)(height & 0xFF));
+        jpeg.Add((byte)(width  >> 8)); jpeg.Add((byte)(width  & 0xFF));
+        jpeg.Add(1);                                     // one component => grayscale
+        jpeg.Add(1); jpeg.Add(0x11); jpeg.Add(0);        // id 1, 1x1 sampling, quant table 0
+
+        Marker(0xC4); Length(1 + 16 + DcVals.Length);    // DHT, DC table 0
+        jpeg.Add(0x00); jpeg.AddRange(DcBits); jpeg.AddRange(DcVals);
+
+        Marker(0xC4); Length(1 + 16 + AcVals.Length);    // DHT, AC table 0
+        jpeg.Add(0x10); jpeg.AddRange(AcBits); jpeg.AddRange(AcVals);
+
+        Marker(0xDA); Length(6);                         // SOS
+        jpeg.Add(1); jpeg.Add(1); jpeg.Add(0x00);
+        jpeg.Add(0); jpeg.Add(63); jpeg.Add(0);
+
+        var dc = BuildHuffman(DcBits, DcVals);
+        var ac = BuildHuffman(AcBits, AcVals);
+        var bits = new JpegBitWriter();
+        int coefficient = 8 * (luma - 128);              // flat block => DC only
+        for (int block = 0, blocks = (width / 8) * (height / 8); block < blocks; block++)
+        {
+            int diff = block == 0 ? coefficient : 0;     // the DC is coded as a difference
+            int category = 0;
+            for (int magnitude = Math.Abs(diff); magnitude != 0; magnitude >>= 1) category++;
+
+            bits.Write(dc[category].Code, dc[category].Length);
+            if (category > 0) bits.Write(diff > 0 ? diff : diff + (1 << category) - 1, category);
+            bits.Write(ac[0x00].Code, ac[0x00].Length);  // EOB: no AC coefficients at all
+        }
+        bits.Pad();
+        jpeg.AddRange(bits.ToArray());
+
+        Marker(0xD9);                                    // EOI
+        return jpeg.ToArray();
+    }
+
+    // Annex K's example luminance Huffman tables — what baseline JPEGs in the
+    // wild carry, so the decode path this exercises is the ordinary one.
+    private static readonly byte[] DcBits = { 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0 };
+    private static readonly byte[] DcVals = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    private static readonly byte[] AcBits = { 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D };
+    private static readonly byte[] AcVals =
+    {
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+        0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+        0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+        0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+        0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+        0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+        0xF9, 0xFA,
+    };
+
+    /// <summary>Canonical Huffman codes from a JPEG (BITS, HUFFVAL) table pair.</summary>
+    private static (int Code, int Length)[] BuildHuffman(byte[] counts, byte[] values)
+    {
+        var table = new (int, int)[256];
+        int code = 0, v = 0;
+        for (int length = 1; length <= 16; length++)
+        {
+            for (int i = 0; i < counts[length - 1]; i++) table[values[v++]] = (code++, length);
+            code <<= 1;
+        }
+        return table;
+    }
+
+    /// <summary>MSB-first bit writer with JPEG's 0xFF byte stuffing.</summary>
+    private sealed class JpegBitWriter
+    {
+        private readonly List<byte> _bytes = new();
+        private int _accumulator, _held;
+
+        public void Write(int code, int length)
+        {
+            for (int i = length - 1; i >= 0; i--)
+            {
+                _accumulator = (_accumulator << 1) | ((code >> i) & 1);
+                if (++_held != 8) continue;
+
+                var b = (byte)_accumulator;
+                _bytes.Add(b);
+                if (b == 0xFF) _bytes.Add(0x00);   // stuffing: a bare 0xFF would start a marker
+                _accumulator = 0; _held = 0;
+            }
+        }
+
+        /// <summary>Flushes the last partial byte, padded with 1 bits as the spec requires.</summary>
+        public void Pad() { if (_held > 0) Write((1 << (8 - _held)) - 1, 8 - _held); }
+
+        public byte[] ToArray() => _bytes.ToArray();
+    }
 
     private static unsafe byte[] MakeJpeg(int width, int height, int seed, byte? flatLuma = null)
     {

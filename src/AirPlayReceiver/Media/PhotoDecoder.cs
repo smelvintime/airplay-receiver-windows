@@ -278,9 +278,9 @@ public sealed unsafe class PhotoDecoder : IDisposable
     {
         int srcW = src->width, srcH = src->height;
 
-        AVPixelFormat srcFmt   = (AVPixelFormat)src->format;
-        AVPixelFormat wireFmt  = AsFullRangeFormat(srcFmt, src->color_range);
-        bool          jpegRange = wireFmt != srcFmt || IsJpegFormat(srcFmt);
+        AVPixelFormat srcFmt    = (AVPixelFormat)src->format;
+        AVPixelFormat wireFmt   = AsFullRangeFormat(srcFmt, src->color_range);
+        bool          fullRange = ReadAsFullRange(wireFmt);
 
         (int dstW, int dstH) = FitWithin(srcW, srcH);
 
@@ -315,7 +315,7 @@ public sealed unsafe class PhotoDecoder : IDisposable
 
             _swsSrcW = srcW; _swsSrcH = srcH; _swsDstW = dstW; _swsDstH = dstH; _swsSrcFmt = wireFmt;
             Log.Info("Photo", $"scaler {srcW}×{srcH} {srcFmt} " +
-                              $"({(jpegRange ? "full" : "limited")} range, given to swscale as {wireFmt}) " +
+                              $"({(fullRange ? "full" : "limited")} range, given to swscale as {wireFmt}) " +
                               $"→ {dstW}×{dstH} NV12 (limited range)");
         }
 
@@ -399,6 +399,26 @@ public sealed unsafe class PhotoDecoder : IDisposable
         or AVPixelFormat.AV_PIX_FMT_YUVJ440P
         or AVPixelFormat.AV_PIX_FMT_YUVJ444P
         or AVPixelFormat.AV_PIX_FMT_YUVJ411P;
+
+    /// <summary>
+    /// Grayscale — what a black-and-white (single-component) JPEG decodes to.
+    /// These are the formats FFmpeg's MJPEG decoder emits for one component: 8-bit
+    /// photos give GRAY8, 12/16-bit ones GRAY16.
+    /// </summary>
+    private static bool IsGrayFormat(AVPixelFormat fmt) => fmt
+        is AVPixelFormat.AV_PIX_FMT_GRAY8
+        or AVPixelFormat.AV_PIX_FMT_GRAY16LE
+        or AVPixelFormat.AV_PIX_FMT_GRAY16BE;
+
+    /// <summary>
+    /// Whether libswscale will read this source format as full-range, and hence
+    /// perform the conversion to the presenter's limited range. Its internal
+    /// <c>handle_jpeg()</c> answers yes for the YUVJ twins <b>and</b> for every
+    /// grayscale format — see <see cref="AsFullRangeFormat"/> for why the second
+    /// half of that matters. Used only for the log line; the conversion itself is
+    /// driven by the format handed to <c>sws_getContext</c>.
+    /// </summary>
+    private static bool ReadAsFullRange(AVPixelFormat fmt) => IsJpegFormat(fmt) || IsGrayFormat(fmt);
 
     /// <summary>
     /// Largest even-sized box with the source aspect ratio that fits the display
