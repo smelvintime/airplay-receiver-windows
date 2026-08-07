@@ -242,6 +242,25 @@ public sealed class HlsCoordinator : IAsyncDisposable
             return BadRequest(msg);
         }
 
+        // Only a sender that completed the /reverse (PTTH) upgrade for this session
+        // may drive playback from here.
+        //
+        // The Store.Current check below cannot carry that weight on its own:
+        // Store.Current is null whenever nothing is playing, and stays null through
+        // any Direct-route (plain http(s)) playback, because HandlePlay's Direct
+        // branch never touches the Store. In the receiver's normal idle state the
+        // check is therefore a no-op, and any LAN device could POST a hand-built
+        // playlistInsert with an invented session id and reach the player.
+        //
+        // A phone that never opened an event channel could not answer an FCUP
+        // request either, so it has no legitimate reason to be posting /action.
+        if (!_channels.HasChannel(sessionId!, ReverseChannel.PurposeEvent))
+        {
+            Log.Error("HLS", $"/action for session={sessionId} which holds no live reverse event channel " +
+                             "— refusing to drive playback, 400");
+            return BadRequest(msg);
+        }
+
         HlsVideo? current = Store.Current;
         if (current is not null &&
             !string.IsNullOrEmpty(current.AppleSessionId) &&
