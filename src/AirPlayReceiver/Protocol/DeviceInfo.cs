@@ -22,7 +22,11 @@ public sealed class DeviceInfo
     /// <summary>64-bit AirPlay features bitmask (matches the mDNS "features" TXT value).</summary>
     public long Features { get; init; }
 
-    public string Model         { get; init; } = "AppleTV6,2";
+    // Must match what mDNS advertises (MdnsService.AirPlayModel / AirPlaySrcVers).
+    // AppleTV3,2 is the only model coherent with srcvers 220.68 — an AirPlay-1-era
+    // server version. Claiming a 4K model here would invite AirPlay 2 semantics
+    // (transient pairing, PTP, HomeKit) this receiver does not implement.
+    public string Model         { get; init; } = "AppleTV3,2";
     public string SourceVersion { get; init; } = "220.68";
 
     /// <summary>Persistent device GUID string.</summary>
