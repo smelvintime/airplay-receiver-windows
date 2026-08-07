@@ -234,6 +234,36 @@ internal static class Program
             Check("no photo was dropped by an inactive surface", rig.Sink.DroppedFrames == 0,
                   $"{rig.Sink.DroppedFrames} frame(s) dropped");
         }
+
+        // ── Scenario 10: a key whose spelling varies must not grow the MRU ────
+        // The entry dictionary matches asset keys case-insensitively; a List's
+        // Remove does not. When the two disagree, every repeat displayCached
+        // appends another MRU entry for an asset that is already there, and
+        // eviction then starts popping keys that are not the least-recently-used
+        // one — i.e. dropping a photo iOS is about to ask for.
+        using (var rig = new Rig())
+        {
+            const string Upper = "AABBCCDD-1111-2222-3333-444455556666";
+            string lower = Upper.ToLowerInvariant();
+
+            rig.Put("/photo", photoB, key: Upper, action: PhotoHandler.ActionCacheOnly);
+            for (int i = 0; i < 4; i++)
+                rig.Put("/photo", Array.Empty<byte>(), key: lower, action: PhotoHandler.ActionDisplayCached);
+
+            Check("a case-varying key hits the same cache entry", rig.Handler.Cache.Hits == 4,
+                  $"hits={rig.Handler.Cache.Hits}, misses={rig.Handler.Cache.Misses}");
+            Check("repeat displays keep one cache entry", rig.Handler.Cache.Count == 1,
+                  $"cache holds {rig.Handler.Cache.Count}");
+            Check("repeat displays do not grow the MRU list", rig.Handler.Cache.MruCount == 1,
+                  $"MRU holds {rig.Handler.Cache.MruCount} for {rig.Handler.Cache.Count} entry/entries");
+
+            rig.Put("/photo", photoB, key: lower, action: PhotoHandler.ActionCacheOnly);
+            Check("re-storing under another spelling replaces rather than duplicates",
+                  rig.Handler.Cache.Count == 1 && rig.Handler.Cache.MruCount == 1,
+                  $"{rig.Handler.Cache.Count} entry/entries, MRU {rig.Handler.Cache.MruCount}");
+            Check("the byte total counts that asset once", rig.Handler.Cache.Bytes == photoB.Length,
+                  $"cache holds {rig.Handler.Cache.Bytes}B, JPEG is {photoB.Length}B");
+        }
     }
 
     /// <summary>

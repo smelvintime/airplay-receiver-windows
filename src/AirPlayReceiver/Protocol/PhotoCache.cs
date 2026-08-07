@@ -39,10 +39,23 @@ public sealed class PhotoCache
 
     private readonly object _sync = new();
 
+    /// <summary>
+    /// How an asset key is matched — and it must be the <b>same</b> rule for both
+    /// structures below. <see cref="List{T}.Remove"/> compares strings ordinally,
+    /// so a case-varying key would hit <see cref="_entries"/> while its
+    /// <see cref="_mru"/> removal silently missed: the touch in
+    /// <see cref="TryGet"/> would then append a duplicate on every
+    /// <c>displayCached</c>, growing the list without bound, and eviction would
+    /// start popping keys that are no longer the least-recently-used one.
+    /// iOS spells its UUIDs consistently today, which is exactly why this would
+    /// go unnoticed until some phone or spec revision didn't.
+    /// </summary>
+    private static readonly StringComparer KeyComparer = StringComparer.OrdinalIgnoreCase;
+
     // Key → JPEG bytes, plus a parallel MRU-ordered key list (most recent last).
     // A list rather than a LinkedList: at a few dozen entries the O(n) Remove is
     // far cheaper than the extra node bookkeeping, and it keeps eviction obvious.
-    private readonly Dictionary<string, byte[]> _entries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, byte[]> _entries = new(KeyComparer);
     private readonly List<string> _mru = new();
     private long _bytes;
 
@@ -65,6 +78,13 @@ public sealed class PhotoCache
 
     /// <summary>Total bytes held.</summary>
     public long Bytes { get { lock (_sync) return _bytes; } }
+
+    /// <summary>
+    /// Length of the MRU list, which must always equal <see cref="Count"/>.
+    /// Exposed for the harness: the two structures drifting apart is invisible
+    /// from the outside until eviction starts dropping the wrong asset.
+    /// </summary>
+    public int MruCount { get { lock (_sync) return _mru.Count; } }
 
     public long Hits      { get { lock (_sync) return _hits; } }
     public long Misses    { get { lock (_sync) return _misses; } }
@@ -91,7 +111,7 @@ public sealed class PhotoCache
             if (_entries.TryGetValue(assetKey, out byte[]? existing))
             {
                 _bytes -= existing.Length;
-                _mru.Remove(assetKey);
+                RemoveFromMru(assetKey);
             }
 
             _entries[assetKey] = jpeg;
@@ -124,7 +144,7 @@ public sealed class PhotoCache
             }
 
             // Touch: move to the MRU end so a photo iOS keeps revisiting survives.
-            _mru.Remove(assetKey);
+            RemoveFromMru(assetKey);
             _mru.Add(assetKey);
             _hits++;
             return true;
@@ -146,6 +166,18 @@ public sealed class PhotoCache
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Drops <paramref name="assetKey"/> from the MRU list using
+    /// <see cref="KeyComparer"/> — <see cref="List{T}.Remove"/> would use the
+    /// ordinal default and leave the two structures disagreeing.
+    /// Caller must hold <see cref="_sync"/>.
+    /// </summary>
+    private void RemoveFromMru(string assetKey)
+    {
+        int i = _mru.FindIndex(k => KeyComparer.Equals(k, assetKey));
+        if (i >= 0) _mru.RemoveAt(i);
+    }
 
     /// <summary>Caller must hold <see cref="_sync"/>.</summary>
     private void EvictWhileOverBudget()
