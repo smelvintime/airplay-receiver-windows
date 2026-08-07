@@ -320,7 +320,11 @@ public sealed class AirPlaySession : IAsyncDisposable
         // POST/PUT sets the position; GET reports it.
         if (msg.Method == "GET")
         {
-            string text = $"duration: {_videoPlayer.Duration}\r\nposition: {_videoPlayer.Position}\r\n";
+            // Invariant culture is not optional here: on a comma-decimal locale
+            // the default interpolation emits "duration: 12,5", which iOS cannot
+            // parse — the scrubber then reads as a zero-length track.
+            string text = $"duration: {Inv(_videoPlayer.Duration)}\r\n" +
+                          $"position: {Inv(_videoPlayer.Position)}\r\n";
             return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
                 new Dictionary<string, string> { ["Content-Type"] = "text/parameters" },
                 Encoding.UTF8.GetBytes(text), protocol: msg.Version);
