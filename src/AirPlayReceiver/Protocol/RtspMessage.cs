@@ -14,6 +14,19 @@ namespace AirPlayReceiver.Protocol;
 /// </summary>
 public sealed class RtspMessage
 {
+    /// <summary>
+    /// Largest request body accepted, checked <b>before</b> a single byte is
+    /// allocated.
+    ///
+    /// Content-Length arrives unauthenticated on port 7000 and used to be handed
+    /// straight to <c>new byte[]</c>, so one small packet claiming
+    /// <c>Content-Length: 2147483647</c> forced a ~2 GB allocation. The largest
+    /// legitimate body is a photo — a full-resolution iPhone JPEG is a few MB, and
+    /// <see cref="PhotoCache"/> refuses any single asset over its 192 MB budget —
+    /// so 64 MB sits far above anything real while keeping the allocation bounded.
+    /// </summary>
+    public const int MaxBodyBytes = 64 * 1024 * 1024;
+
     // Request fields
     public string Method    { get; init; } = string.Empty;
     public string Uri       { get; init; } = string.Empty;
@@ -138,6 +151,15 @@ public sealed class RtspMessage
         }
 
         // Read body if Content-Length is present
+        if (msg.ContentLength > MaxBodyBytes)
+        {
+            // Returning null ends the read loop, so the caller closes the socket:
+            // we cannot resynchronise on a body we refuse to read.
+            Log.Error("RTSP", $"{msg.Method} {msg.Uri}: Content-Length {msg.ContentLength} exceeds the " +
+                              $"{MaxBodyBytes}B ceiling — refusing the message and closing the connection");
+            return null;
+        }
+
         if (msg.ContentLength > 0)
         {
             msg.Body = new byte[msg.ContentLength];
@@ -145,8 +167,21 @@ public sealed class RtspMessage
             while (read < msg.ContentLength)
             {
                 int n = await stream.ReadAsync(msg.Body.AsMemory(read), ct);
-                if (n == 0) break;
+                if (n == 0) break;   // EOF mid-body
                 read += n;
+            }
+
+            // A short read used to be swallowed: the `read` count was dropped and
+            // the zero-padded tail handed on as if it were the whole body. Nothing
+            // downstream can tell the difference, and PhotoHandler caches what it
+            // is given — so one truncated PUT /photo poisons that asset key for the
+            // rest of the session, because a later displayCached hits the cache and
+            // never triggers the 412 that would make the sender re-push it.
+            if (read != msg.ContentLength)
+            {
+                Log.Error("RTSP", $"{msg.Method} {msg.Uri}: body truncated at {read}B of {msg.ContentLength}B " +
+                                  "— refusing the message (a partial body is not valid data)");
+                return null;
             }
         }
 
