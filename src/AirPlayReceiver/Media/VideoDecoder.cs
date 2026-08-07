@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using FFmpeg.AutoGen;
 using System;
 using System.Collections.Concurrent;
@@ -94,12 +95,12 @@ public sealed class VideoDecoder : IDisposable
 
         if (ret < 0)
         {
-            System.Diagnostics.Debug.WriteLine($"[Decoder] D3D11VA unavailable (err={ret}), falling back to software.");
+            Log.Warn("Decoder", $"D3D11VA unavailable (err={ret}), falling back to software.");
             hwCtx = null;
         }
         else
         {
-            System.Diagnostics.Debug.WriteLine("[Decoder] D3D11VA hardware context created.");
+            Log.Info("Decoder", "D3D11VA hardware context created.");
         }
 
         _hwDeviceCtx = hwCtx;
@@ -141,7 +142,7 @@ public sealed class VideoDecoder : IDisposable
         _frame   = ffmpeg.av_frame_alloc();
         _swFrame = ffmpeg.av_frame_alloc();
 
-        System.Diagnostics.Debug.WriteLine($"[Decoder] Opened codec: {Marshal.PtrToStringAnsi((IntPtr)codec->name)}");
+        Log.Info("Decoder", $"Opened codec: {Marshal.PtrToStringAnsi((IntPtr)codec->name)}");
     }
 
     // ── Packet submission ─────────────────────────────────────────────────────
@@ -184,7 +185,7 @@ public sealed class VideoDecoder : IDisposable
 
     private void DecodeLoop()
     {
-        System.Diagnostics.Debug.WriteLine("[Decoder] Decode thread started.");
+        Log.Info("Decoder", "Decode thread started.");
 
         try
         {
@@ -195,14 +196,14 @@ public sealed class VideoDecoder : IDisposable
                 {
                     // A single bad packet (e.g. during a mid-stream resolution switch)
                     // must not fault the decode thread and crash the whole process.
-                    System.Diagnostics.Debug.WriteLine($"[Decoder] decode error (skipped): {ex.Message}");
+                    Log.Error("Decoder", $"decode error (skipped): {ex.Message}");
                 }
             }
         }
         catch (OperationCanceledException) { }
         catch (InvalidOperationException) { } // queue completed while blocked in TryTake
 
-        System.Diagnostics.Debug.WriteLine("[Decoder] Decode thread stopped.");
+        Log.Info("Decoder", "Decode thread stopped.");
     }
 
     private unsafe void DecodePacket(byte[] data)
@@ -215,7 +216,7 @@ public sealed class VideoDecoder : IDisposable
             int ret = ffmpeg.avcodec_send_packet(_codecCtx, _packet);
             if (ret < 0)
             {
-                System.Diagnostics.Debug.WriteLine($"[Decoder] avcodec_send_packet error: {ret}");
+                Log.Error("Decoder", $"avcodec_send_packet error: {ret}");
                 return;
             }
         }
@@ -227,7 +228,7 @@ public sealed class VideoDecoder : IDisposable
                 break;
             if (ret < 0)
             {
-                System.Diagnostics.Debug.WriteLine($"[Decoder] avcodec_receive_frame error: {ret}");
+                Log.Error("Decoder", $"avcodec_receive_frame error: {ret}");
                 break;
             }
 
@@ -239,7 +240,7 @@ public sealed class VideoDecoder : IDisposable
                 _lastWidth  = _frame->width;
                 _lastHeight = _frame->height;
                 _onDimensions(_frame->width, _frame->height);
-                System.Diagnostics.Debug.WriteLine($"[Decoder] Stream: {_frame->width}×{_frame->height}  " +
+                Log.Info("Decoder", $"Stream: {_frame->width}×{_frame->height}  " +
                                   $"fmt={_frame->format}  hw={(AVPixelFormat)_frame->format == AVPixelFormat.AV_PIX_FMT_D3D11}");
             }
 
@@ -253,7 +254,7 @@ public sealed class VideoDecoder : IDisposable
                 int tr = ffmpeg.av_hwframe_transfer_data(_swFrame, _frame, 0);
                 if (tr < 0)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[Decoder] av_hwframe_transfer_data error: {tr}");
+                    Log.Error("Decoder", $"av_hwframe_transfer_data error: {tr}");
                     ffmpeg.av_frame_unref(_frame);
                     continue;
                 }
@@ -266,7 +267,7 @@ public sealed class VideoDecoder : IDisposable
             _onFrame((IntPtr)outFrame);
 
             if (++_frameCount % 60 == 0)
-                System.Diagnostics.Debug.WriteLine($"[Decoder] decoded {_frameCount} frames ({_lastWidth}×{_lastHeight})");
+                Log.Info("Decoder", $"decoded {_frameCount} frames ({_lastWidth}×{_lastHeight})");
 
             if (transferred) ffmpeg.av_frame_unref(_swFrame);
             ffmpeg.av_frame_unref(_frame);
@@ -289,7 +290,7 @@ public sealed class VideoDecoder : IDisposable
         }
 
         // D3D11 not available for this frame — fall back to first offered format.
-        System.Diagnostics.Debug.WriteLine("[Decoder] D3D11 format not offered; using software fallback.");
+        Log.Warn("Decoder", "D3D11 format not offered; using software fallback.");
         return *fmts;
     }
 

@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using System;
 using System.Buffers;
 using System.Net;
@@ -79,7 +80,7 @@ public sealed class RtpReceiver : IAsyncDisposable
         _cts      = new CancellationTokenSource();
         _udpData  = new UdpClient(VideoDataPort);
 
-        System.Diagnostics.Debug.WriteLine($"[RTP] Listening on UDP {VideoDataPort}");
+        Log.Info("RTP", $"Listening on UDP {VideoDataPort}");
 
         _receiveLoop = ReceiveLoopAsync(_cts.Token);
         return Task.CompletedTask;
@@ -91,7 +92,7 @@ public sealed class RtpReceiver : IAsyncDisposable
         _udpData?.Close();
         if (_receiveLoop is not null)
             await _receiveLoop.ConfigureAwait(false);
-        System.Diagnostics.Debug.WriteLine("[RTP] Stopped.");
+        Log.Info("RTP", "Stopped.");
     }
 
     public void Flush()
@@ -116,7 +117,7 @@ public sealed class RtpReceiver : IAsyncDisposable
             catch (OperationCanceledException) { break; }
             catch (SocketException ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[RTP] Socket error: {ex.Message}");
+                Log.Error("RTP", $"Socket error: {ex.Message}");
                 break;
             }
 
@@ -197,7 +198,7 @@ public sealed class RtpReceiver : IAsyncDisposable
                 break;
 
             default:
-                System.Diagnostics.Debug.WriteLine($"[RTP H.264] Unhandled NAL type {nalType}");
+                Log.Warn("RTP H.264", $"Unhandled NAL type {nalType}");
                 break;
         }
     }

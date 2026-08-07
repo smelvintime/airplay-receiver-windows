@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using FFmpeg.AutoGen;
 using System;
 using System.Runtime.InteropServices;
@@ -46,7 +47,7 @@ public sealed unsafe class AudioDecoder : IDisposable
 
         _pkt   = ffmpeg.av_packet_alloc();
         _frame = ffmpeg.av_frame_alloc();
-        System.Diagnostics.Debug.WriteLine("[Audio] AAC-ELD decoder opened (44100/2, ASC F8E85000)");
+        Log.Info("Audio", "AAC-ELD decoder opened (44100/2, ASC F8E85000)");
     }
 
     /// <summary>Decodes one raw AAC-ELD access unit, emitting interleaved float PCM frames.</summary>
@@ -59,7 +60,7 @@ public sealed unsafe class AudioDecoder : IDisposable
             int sret = ffmpeg.avcodec_send_packet(_ctx, _pkt);
             if (sret < 0)
             {
-                if (!_loggedFirst) System.Diagnostics.Debug.WriteLine($"[Audio] avcodec_send_packet error {sret}");
+                if (!_loggedFirst) Log.Warn("Audio", $"avcodec_send_packet error {sret}");
                 return;
             }
         }
@@ -70,7 +71,7 @@ public sealed unsafe class AudioDecoder : IDisposable
             if (rret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || rret == ffmpeg.AVERROR_EOF) break;
             if (rret < 0)
             {
-                System.Diagnostics.Debug.WriteLine($"[Audio] avcodec_receive_frame error {rret}");
+                Log.Warn("Audio", $"avcodec_receive_frame error {rret}");
                 break;
             }
 
@@ -81,7 +82,7 @@ public sealed unsafe class AudioDecoder : IDisposable
             if (!_loggedFirst)
             {
                 _loggedFirst = true;
-                System.Diagnostics.Debug.WriteLine($"[Audio] first frame decoded → {pcm.Length}B PCM (playing)");
+                Log.Info("Audio", $"first frame decoded → {pcm.Length}B PCM (playing)");
             }
             _onPcm(pcm);
         }

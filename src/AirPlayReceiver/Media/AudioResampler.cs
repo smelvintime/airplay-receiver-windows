@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using FFmpeg.AutoGen;
 using System;
 
@@ -41,7 +42,7 @@ public sealed unsafe class AudioResampler : IDisposable
         if (ret < 0)
             throw new InvalidOperationException($"swr_init failed: {ret}");
 
-        System.Diagnostics.Debug.WriteLine($"[Audio] Resampler: {_inRate} → {_outRate} Hz (FLT stereo)");
+        Log.Info("Audio", $"Resampler: {_inRate} → {_outRate} Hz (FLT stereo)");
     }
 
     /// <summary>

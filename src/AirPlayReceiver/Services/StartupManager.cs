@@ -26,7 +26,7 @@ public static class StartupManager
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Startup] query failed: {ex.Message}");
+            Log.Warn("Startup", $"query failed: {ex.Message}");
             return false;
         }
     }
@@ -41,11 +41,11 @@ public static class StartupManager
             using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true)
                             ?? Registry.CurrentUser.CreateSubKey(RunKeyPath);
             key?.SetValue(ValueName, $"\"{exe}\" {MinimizedArg}");
-            System.Diagnostics.Debug.WriteLine("[Startup] enabled (launches at sign-in, minimized).");
+            Log.Info("Startup", "enabled (launches at sign-in, minimized).");
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Startup] enable failed: {ex.Message}");
+            Log.Warn("Startup", $"enable failed: {ex.Message}");
         }
     }
 
@@ -58,7 +58,7 @@ public static class StartupManager
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Startup] disable failed: {ex.Message}");
+            Log.Warn("Startup", $"disable failed: {ex.Message}");
         }
     }
 }

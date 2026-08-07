@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using System;
 using System.Net;
 using System.Net.Sockets;
@@ -81,14 +82,13 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Audio] decode/output unavailable: {ex.Message}");
+            Log.Error("Audio", "decode/output unavailable", ex);
             _decoder = null;
             _output  = null;
         }
 
         _cts = new CancellationTokenSource();
-        System.Diagnostics.Debug.WriteLine(
-            $"[Audio] data UDP {DataPort}, control UDP {ControlPort} (decrypt={_crypto is not null}, play={_output is not null})");
+        Log.Info("Audio", $"data UDP {DataPort}, control UDP {ControlPort} (decrypt={_crypto is not null}, play={_output is not null})");
 
         _ = ReceiveDataAsync(_cts.Token);
         _ = ReceiveControlAsync(_cts.Token);
@@ -124,8 +124,7 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
                     _lastSeq = (ushort)(seq - 1);
                     _sw.Start();
                     bool eld = payload[0] is 0x8c or 0x8d or 0x8e or 0x80 or 0x81 or 0x82;
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Audio] first packet {payloadLen}B, first byte 0x{payload[0]:X2} " +
+                    Log.Info("Audio", $"first packet {payloadLen}B, first byte 0x{payload[0]:X2} " +
                         $"({(eld ? "valid AAC-ELD — decryption OK" : "NOT AAC-ELD — key/iv mismatch?")})");
                 }
 
@@ -152,15 +151,14 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
                     double wall  = _sw.Elapsed.TotalSeconds;
                     double tsSec = (uint)(_lastTs - _firstTs) / 44100.0;  // stream time elapsed per RTP clock
                     double ratio = wall > 0 ? tsSec / wall : 0;            // ~1.0 = real-time; >1 fast; <1 slow
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Audio] {_count} pkts ({_decodedFrames} decoded) | wall={wall:F1}s streamTs={tsSec:F1}s ratio={ratio:F2} " +
+                    Log.Info("Audio", $"{_count} pkts ({_decodedFrames} decoded) | wall={wall:F1}s streamTs={tsSec:F1}s ratio={ratio:F2} " +
                         $"payload={payloadLen}B buffered={_output?.BufferedMs ?? -1}ms " +
                         $"discarded={_output?.DiscardedBytes ?? -1}B seqGaps={_seqGaps}");
                 }
             }
         }
         catch (Exception ex) when (ex is OperationCanceledException or SocketException or ObjectDisposedException) { }
-        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[Audio] data loop error: {ex.Message}"); }
+        catch (Exception ex) { Log.Error("Audio", "data loop error", ex); }
     }
 
     private async Task ReceiveControlAsync(CancellationToken ct)
@@ -182,6 +180,6 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
         _output?.Dispose();
         _decoder?.Dispose();
         await Task.CompletedTask;
-        System.Diagnostics.Debug.WriteLine("[Audio] Stopped.");
+        Log.Info("Audio", "Stopped.");
     }
 }

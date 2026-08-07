@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Signers;
 using Org.BouncyCastle.Security;
@@ -54,7 +55,7 @@ public sealed class DeviceIdentity
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Identity] Failed to load identity: {ex.Message}");
+            Log.Warn("Identity", $"Failed to load identity: {ex.Message}");
         }
 
         var generated = new Ed25519PrivateKeyParameters(new SecureRandom());
@@ -65,7 +66,7 @@ public sealed class DeviceIdentity
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Identity] Failed to persist identity: {ex.Message}");
+            Log.Warn("Identity", $"Failed to persist identity: {ex.Message}");
         }
 
         return new DeviceIdentity(generated);

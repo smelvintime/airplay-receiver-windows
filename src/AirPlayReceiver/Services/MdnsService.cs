@@ -85,7 +85,7 @@ public sealed class MdnsService : IAsyncDisposable
         _mdns.NetworkInterfaceDiscovered += (_, e) =>
         {
             foreach (var nic in e.NetworkInterfaces)
-                System.Diagnostics.Debug.WriteLine($"[mDNS] Listening on interface: {nic.Name}");
+                Log.Info("mDNS", $"Listening on interface: {nic.Name}");
         };
 
         // Per-query logging was invaluable while bringing discovery up, but iOS
@@ -97,7 +97,7 @@ public sealed class MdnsService : IAsyncDisposable
 
         _mdns.Start();
 
-        System.Diagnostics.Debug.WriteLine($"[mDNS] Advertising '{_deviceName}' on port {_port}  deviceid={_deviceId}");
+        Log.Info("mDNS", $"Advertising '{_deviceName}' on port {_port}  deviceid={_deviceId}");
         return Task.CompletedTask;
     }
 
@@ -105,7 +105,7 @@ public sealed class MdnsService : IAsyncDisposable
     {
         _cts?.Cancel();
         _mdns.Stop();
-        System.Diagnostics.Debug.WriteLine("[mDNS] Stopped.");
+        Log.Info("mDNS", "Stopped.");
         return Task.CompletedTask;
     }
 

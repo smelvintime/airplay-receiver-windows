@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using System;
 using System.Net;
 using System.Net.Sockets;
@@ -52,8 +53,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
 
-        System.Diagnostics.Debug.WriteLine(
-            $"[Mirror] Listening for video on TCP {Port} (decrypt={_crypto is not null}, decode={_decoder is not null})");
+        Log.Info("Mirror", $"Listening for video on TCP {Port} (decrypt={_crypto is not null}, decode={_decoder is not null})");
         _acceptLoop = AcceptLoopAsync(_cts.Token);
     }
 
@@ -66,7 +66,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             try { await _acceptLoop.ConfigureAwait(false); }
             catch (Exception ex) when (ex is OperationCanceledException or SocketException or ObjectDisposedException) { }
         }
-        System.Diagnostics.Debug.WriteLine("[Mirror] Stopped.");
+        Log.Info("Mirror", "Stopped.");
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
@@ -84,7 +84,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             catch (SocketException) { break; }
             catch (ObjectDisposedException) { break; }
 
-            System.Diagnostics.Debug.WriteLine($"[Mirror] Video connection from {client.Client.RemoteEndPoint}");
+            Log.Info("Mirror", $"Video connection from {client.Client.RemoteEndPoint}");
             _ = ReceiveLoopAsync(client, ct);
         }
     }
@@ -104,7 +104,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
 
                 if (payloadLength < 0 || payloadLength > 16 * 1024 * 1024)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[Mirror] Bogus payload length {payloadLength}; dropping connection");
+                    Log.Error("Mirror", $"Bogus payload length {payloadLength}; dropping connection");
                     break;
                 }
 
@@ -121,7 +121,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         }
         catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException)
         {
-            System.Diagnostics.Debug.WriteLine($"[Mirror] Video connection ended: {ex.Message}");
+            Log.Info("Mirror", $"Video connection ended: {ex.Message}");
         }
         finally
         {
@@ -141,7 +141,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         if (!ConvertAvccToAnnexBInPlace(payload))
         {
             // Malformed after decryption almost always means the key is wrong.
-            System.Diagnostics.Debug.WriteLine("[Mirror] video frame not valid AVCC after decrypt (key mismatch?)");
+            Log.Info("Mirror", "video frame not valid AVCC after decrypt (key mismatch?)");
             return;
         }
 
@@ -150,8 +150,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
         if (!_firstFrameLogged)
         {
             _firstFrameLogged = true;
-            System.Diagnostics.Debug.WriteLine(
-                $"[Mirror] first video frame decrypted OK ({payload.Length}B, first NAL type={firstNalType}) — decryption works");
+            Log.Info("Mirror", $"first video frame decrypted OK ({payload.Length}B, first NAL type={firstNalType}) — decryption works");
         }
 
         // Prepend the cached SPS/PPS to every IDR keyframe (NAL type 5). The decoder
@@ -196,7 +195,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             int numPpsOff = spsOff + spsLen;
             int ppsLen = (p[numPpsOff + 1] << 8) | p[numPpsOff + 2];
             int ppsOff = numPpsOff + 3;
-            if (ppsOff + ppsLen > p.Length) { System.Diagnostics.Debug.WriteLine("[Mirror] malformed avcC config"); return; }
+            if (ppsOff + ppsLen > p.Length) { Log.Warn("Mirror", "malformed avcC config"); return; }
 
             byte[] annexB = new byte[4 + spsLen + 4 + ppsLen];
             int o = 0;
@@ -209,11 +208,11 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
             // instead of submitting them as a standalone packet — a packet that contains
             // only SPS/PPS and no slice makes the decoder return INVALIDDATA.
             _spsPps = annexB;
-            System.Diagnostics.Debug.WriteLine($"[Mirror] codec config: SPS={spsLen}B PPS={ppsLen}B (cached for keyframes)");
+            Log.Info("Mirror", $"codec config: SPS={spsLen}B PPS={ppsLen}B (cached for keyframes)");
         }
         catch (IndexOutOfRangeException)
         {
-            System.Diagnostics.Debug.WriteLine("[Mirror] malformed avcC config");
+            Log.Warn("Mirror", "malformed avcC config");
         }
     }
 

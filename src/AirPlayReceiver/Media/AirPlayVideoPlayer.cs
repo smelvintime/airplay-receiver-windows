@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using FFmpeg.AutoGen;
 using System;
 using System.Diagnostics;
@@ -74,7 +75,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
 
     public void Play(string url, double startPosition)
     {
-        Debug.WriteLine($"[Video] PLAY url='{url}' startPosition={startPosition}");
+        Log.Info("Video", $"PLAY url='{url}' startPosition={startPosition}");
 
         // A fresh /play replaces whatever was playing.
         StopInternal();
@@ -102,7 +103,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
 
     public void SetRate(double rate)
     {
-        Debug.WriteLine($"[Video] rate={rate} ({(rate > 0 ? "play" : "pause")})");
+        Log.Info("Video", $"rate={rate} ({(rate > 0 ? "play" : "pause")})");
         lock (_stateLock) _rate = rate;
 
         if (rate > 0) _playing.Set();    // resume
@@ -111,7 +112,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
 
     public void Scrub(double position)
     {
-        Debug.WriteLine($"[Video] scrub to {position}s");
+        Log.Info("Video", $"scrub to {position}s");
         lock (_stateLock) _position = position;
         _seekTarget = position;
         // A scrub while paused should still re-seek; the loop checks the target
@@ -120,7 +121,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
 
     public void Stop()
     {
-        Debug.WriteLine("[Video] STOP");
+        Log.Info("Video", "STOP");
         StopInternal();
         _onActive(false);
     }
@@ -162,17 +163,17 @@ public sealed class AirPlayVideoPlayer : IDisposable
 
             fmt = ffmpeg.avformat_alloc_context();
             int ret = ffmpeg.avformat_open_input(&fmt, url, null, null);
-            if (ret < 0) { Debug.WriteLine($"[Video] open_input failed ({Err(ret)}). DRM or unsupported protocol?"); return; }
+            if (ret < 0) { Log.Error("Video", $"open_input failed ({Err(ret)}). DRM or unsupported protocol?"); return; }
 
             ret = ffmpeg.avformat_find_stream_info(fmt, null);
-            if (ret < 0) { Debug.WriteLine($"[Video] find_stream_info failed ({Err(ret)})"); return; }
+            if (ret < 0) { Log.Error("Video", $"find_stream_info failed ({Err(ret)})"); return; }
 
             if (fmt->duration > 0)
                 lock (_stateLock) _duration = fmt->duration / (double)ffmpeg.AV_TIME_BASE;
 
             AVCodec* codec = null;
             int vIdx = ffmpeg.av_find_best_stream(fmt, AVMediaType.AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
-            if (vIdx < 0 || codec == null) { Debug.WriteLine("[Video] no decodable video stream"); return; }
+            if (vIdx < 0 || codec == null) { Log.Error("Video", "no decodable video stream"); return; }
 
             AVStream* stream   = fmt->streams[vIdx];
             AVRational tb       = stream->time_base;
@@ -181,7 +182,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
             ffmpeg.avcodec_parameters_to_context(codecCtx, stream->codecpar);
             codecCtx->thread_count = 0; // let FFmpeg pick (throughput matters more than latency here)
             ret = ffmpeg.avcodec_open2(codecCtx, codec, null);
-            if (ret < 0) { Debug.WriteLine($"[Video] avcodec_open2 failed ({Err(ret)})"); return; }
+            if (ret < 0) { Log.Error("Video", $"avcodec_open2 failed ({Err(ret)})"); return; }
 
             frame  = ffmpeg.av_frame_alloc();
             nv12   = ffmpeg.av_frame_alloc();
@@ -212,7 +213,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
                 }
 
                 ret = ffmpeg.av_read_frame(fmt, packet);
-                if (ret < 0) { Debug.WriteLine("[Video] end of stream"); break; } // EOF or error
+                if (ret < 0) { Log.Info("Video", "end of stream"); break; } // EOF or error
 
                 if (packet->stream_index != vIdx) { ffmpeg.av_packet_unref(packet); continue; }
 
@@ -258,7 +259,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
                             _onDimensions(h, w);
                         else
                             _onDimensions(w, h);
-                        Debug.WriteLine($"[Video] stream {w}×{h} rot={rotation}° fmt={(AVPixelFormat)frame->format} → NV12");
+                        Log.Info("Video", $"stream {w}×{h} rot={rotation}° fmt={(AVPixelFormat)frame->format} → NV12");
                     }
 
                     // sws_scale's destination takes the 4-element array structs, while
@@ -295,7 +296,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { Debug.WriteLine($"[Video] playback error: {ex.Message}"); }
+        catch (Exception ex) { Log.Error("Video", "playback error", ex); }
         finally
         {
             if (sws != null)      ffmpeg.sws_freeContext(sws);
@@ -304,7 +305,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
             if (nv12 != null)     ffmpeg.av_frame_free(&nv12);
             if (codecCtx != null) ffmpeg.avcodec_free_context(&codecCtx);
             if (fmt != null)      ffmpeg.avformat_close_input(&fmt);
-            Debug.WriteLine("[Video] playback loop ended");
+            Log.Info("Video", "playback loop ended");
         }
     }
 
@@ -317,7 +318,7 @@ public sealed class AirPlayVideoPlayer : IDisposable
 
         long ts = (long)(target / ffmpeg.av_q2d(tb));
         int ret = ffmpeg.av_seek_frame(fmt, vIdx, ts, ffmpeg.AVSEEK_FLAG_BACKWARD);
-        if (ret < 0) { Debug.WriteLine($"[Video] seek to {target}s failed ({Err(ret)})"); return; }
+        if (ret < 0) { Log.Warn("Video", $"seek to {target}s failed ({Err(ret)})"); return; }
 
         ffmpeg.avcodec_flush_buffers(codecCtx);
         lock (_stateLock) _position = target;

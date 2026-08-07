@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using System;
@@ -69,7 +70,7 @@ public sealed class AudioOutput : IDisposable
         _device.Init(_buffer);
         _device.Volume = _volume;   // honour any volume set before Start()
         // Don't call Play() yet — we gate on _preFillBytes in Enqueue().
-        System.Diagnostics.Debug.WriteLine($"[Audio] WASAPI output started ({DeviceSampleRate}/2 float, 50ms latency)");
+        Log.Info("Audio", $"WASAPI output started ({DeviceSampleRate}/2 float, 50ms latency)");
     }
 
     /// <summary>Queues a decoded PCM frame for playback. Thread-safe.</summary>
@@ -94,7 +95,7 @@ public sealed class AudioOutput : IDisposable
         {
             _playing = true;
             _device?.Play();
-            System.Diagnostics.Debug.WriteLine("[Audio] pre-fill reached — playback started");
+            Log.Info("Audio", "pre-fill reached — playback started");
         }
     }
 

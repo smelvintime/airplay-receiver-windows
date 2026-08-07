@@ -50,7 +50,7 @@ public sealed class RtspServer : IAsyncDisposable
         _listener = new TcpListener(IPAddress.Any, _port);
         _listener.Start(backlog: 4);
 
-        System.Diagnostics.Debug.WriteLine($"[RTSP] Listening on 0.0.0.0:{_port}");
+        Log.Info("RTSP", $"Listening on 0.0.0.0:{_port}");
 
         _acceptLoop = AcceptLoopAsync(_cts.Token);
         return Task.CompletedTask;
@@ -62,7 +62,7 @@ public sealed class RtspServer : IAsyncDisposable
         _listener?.Stop();
         if (_acceptLoop is not null)
             await _acceptLoop.ConfigureAwait(false);
-        System.Diagnostics.Debug.WriteLine("[RTSP] Stopped.");
+        Log.Info("RTSP", "Stopped.");
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
@@ -95,7 +95,7 @@ public sealed class RtspServer : IAsyncDisposable
             catch (OperationCanceledException) { break; }
             catch (SocketException ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[RTSP] Accept error: {ex.Message}");
+                Log.Error("RTSP", $"Accept error: {ex.Message}");
                 break;
             }
 
@@ -109,7 +109,7 @@ public sealed class RtspServer : IAsyncDisposable
     private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
         var remote = client.Client.RemoteEndPoint;
-        System.Diagnostics.Debug.WriteLine($"[RTSP] Connection from {remote}");
+        Log.Info("RTSP", $"Connection from {remote}");
 
         var session = _sessionFactory();
         _clients.TryAdd(client, 0);
@@ -123,14 +123,14 @@ public sealed class RtspServer : IAsyncDisposable
         catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or ObjectDisposedException)
         {
             // ObjectDisposedException is expected when CloseActiveConnections() drops us.
-            System.Diagnostics.Debug.WriteLine($"[RTSP] Session ended ({remote}): {ex.Message}");
+            Log.Info("RTSP", $"Session ended ({remote}): {ex.Message}");
         }
         finally
         {
             _clients.TryRemove(client, out _);
             client.Dispose();
             SessionEnded?.Invoke(session);
-            System.Diagnostics.Debug.WriteLine($"[RTSP] Closed {remote}");
+            Log.Info("RTSP", $"Closed {remote}");
         }
     }
 }

@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using FFmpeg.AutoGen;
 using Microsoft.UI.Xaml.Controls;
 using SharpDX;
@@ -150,7 +151,7 @@ public sealed unsafe class VideoPresenter : IDisposable
         panel.SizeChanged += (_, e) =>
             Resize((int)e.NewSize.Width, (int)e.NewSize.Height);
 
-        System.Diagnostics.Debug.WriteLine($"[Renderer] Initialized {_swapChainWidth}×{_swapChainHeight}");
+        Log.Info("Renderer", $"Initialized {_swapChainWidth}×{_swapChainHeight}");
     }
 
     // ── Frame presentation ────────────────────────────────────────────────────
@@ -212,7 +213,7 @@ public sealed unsafe class VideoPresenter : IDisposable
             _swapChain.Present(1, PresentFlags.None);
 
             if (++_presentCount % 60 == 0)
-                System.Diagnostics.Debug.WriteLine($"[Renderer] presented {_presentCount} frames ({w}×{h})");
+                Log.Info("Renderer", $"presented {_presentCount} frames ({w}×{h})");
         }
     }
 
@@ -268,7 +269,7 @@ public sealed unsafe class VideoPresenter : IDisposable
             _rotDirty = true;
         }
 
-        System.Diagnostics.Debug.WriteLine($"[Renderer] display rotation = {rot}°");
+        Log.Info("Renderer", $"display rotation = {rot}°");
     }
 
     // ── Resize ────────────────────────────────────────────────────────────────
@@ -294,7 +295,7 @@ public sealed unsafe class VideoPresenter : IDisposable
             _context.Rasterizer.SetViewport(0, 0, width, height);
         }
 
-        System.Diagnostics.Debug.WriteLine($"[Renderer] Resized to {width}×{height}");
+        Log.Info("Renderer", $"Resized to {width}×{height}");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -349,7 +350,7 @@ public sealed unsafe class VideoPresenter : IDisposable
         _frameWidth  = width;
         _frameHeight = height;
 
-        System.Diagnostics.Debug.WriteLine($"[Renderer] NV12 textures {width}×{height}");
+        Log.Info("Renderer", $"NV12 textures {width}×{height}");
     }
 
     private void CompileShaders()

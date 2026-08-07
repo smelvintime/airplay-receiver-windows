@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using AirPlayReceiver.Media;
 using System;
 using System.Collections.Generic;
@@ -82,7 +83,7 @@ public sealed class AirPlaySession : IAsyncDisposable
                 RtspMessage? msg = await RtspMessage.ReadAsync(stream, ct);
                 if (msg is null) break; // client closed connection
 
-                System.Diagnostics.Debug.WriteLine($"[RTSP→] {msg}");
+                Log.Info("RTSP→", $"{msg}");
 
                 byte[] response = msg.Method switch
                 {
@@ -99,7 +100,7 @@ public sealed class AirPlaySession : IAsyncDisposable
                     _               => BuildOk(msg.CSeq),
                 };
 
-                System.Diagnostics.Debug.WriteLine($"[RTSP←] {response.Length}B");
+                Log.Info("RTSP←", $"{response.Length}B");
                 await stream.WriteAsync(response, ct);
 
                 if (msg.Method == "TEARDOWN") break;
@@ -202,7 +203,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             {
                 var dump = new StringBuilder();
                 DumpPlist(dict, dump, 1);
-                System.Diagnostics.Debug.WriteLine($"[Video] /play plist ({body.Length}B):\n{dump}");
+                Log.Info("Video", $"/play plist ({body.Length}B):\n{dump}");
                 url = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
                 if (dict.TryGetValue("Start-Position", out var sp))
                     start = sp switch { double d => d, long l => (double)l, _ => 0.0 };
@@ -210,7 +211,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             else
             {
                 string text = Encoding.UTF8.GetString(body);
-                System.Diagnostics.Debug.WriteLine($"[Video] /play text body:\n{text}");
+                Log.Info("Video", $"/play text body:\n{text}");
                 foreach (string line in text.Split('\n'))
                 {
                     string l = line.Trim();
@@ -223,13 +224,13 @@ public sealed class AirPlaySession : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Video] /play parse failed: {ex.Message}");
+            Log.Warn("Video", $"/play parse failed: {ex.Message}");
         }
 
         if (!string.IsNullOrEmpty(url))
             _videoPlayer.Play(url!, start);
         else
-            System.Diagnostics.Debug.WriteLine($"[Video] /play had no Content-Location (body={body.Length}B)");
+            Log.Warn("Video", $"/play had no Content-Location (body={body.Length}B)");
 
         return Ok(msg);
     }
@@ -266,7 +267,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// <summary>The reverse-HTTP event channel: ack with a protocol switch and keep the connection open.</summary>
     private byte[] HandleReverse(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine("[Video] /reverse — opening PTTH event channel");
+        Log.Info("Video", "/reverse — opening PTTH event channel");
         LogVideoHeaders(msg);
         var headers = new Dictionary<string, string>
         {
@@ -291,20 +292,20 @@ public sealed class AirPlaySession : IAsyncDisposable
             {
                 var dump = new StringBuilder();
                 DumpPlist(BinaryPlist.Parse(body), dump, 1);
-                System.Diagnostics.Debug.WriteLine($"[Video] /action plist ({body.Length}B):\n{dump}");
+                Log.Info("Video", $"/action plist ({body.Length}B):\n{dump}");
             }
-            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[Video] /action parse failed: {ex.Message}"); }
+            catch (Exception ex) { Log.Warn("Video", $"/action parse failed: {ex.Message}"); }
         }
         else
         {
-            System.Diagnostics.Debug.WriteLine($"[Video] /action non-plist body ({body.Length}B)");
+            Log.Info("Video", $"/action non-plist body ({body.Length}B)");
         }
         return Ok(msg);
     }
 
     private byte[] HandlePlaybackInfo(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine($"[Video] GET /playback-info (ready={_videoPlayer.ReadyToPlay} pos={_videoPlayer.Position:F1} dur={_videoPlayer.Duration:F1})");
+        Log.Info("Video", $"GET /playback-info (ready={_videoPlayer.ReadyToPlay} pos={_videoPlayer.Position:F1} dur={_videoPlayer.Duration:F1})");
         var info = new Dictionary<string, object?>
         {
             ["duration"]                = _videoPlayer.Duration,
@@ -400,7 +401,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         };
 
         byte[] body = BinaryPlist.Write(info);
-        System.Diagnostics.Debug.WriteLine($"[Info] returning device info plist ({body.Length}B)");
+        Log.Info("Info", $"returning device info plist ({body.Length}B)");
 
         var headers = new Dictionary<string, string>
         {
@@ -423,7 +424,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         try { parsed = BinaryPlist.Parse(body); }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Setup] plist parse failed: {ex.Message}");
+            Log.Error("Setup", $"plist parse failed: {ex.Message}");
             return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq);
         }
 
@@ -438,7 +439,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         {
             _streamEkey = ekey;
             _streamEiv  = eiv;
-            System.Diagnostics.Debug.WriteLine($"[Setup] phase 1: ekey={ekey.Length}B eiv={eiv.Length}B");
+            Log.Info("Setup", $"phase 1: ekey={ekey.Length}B eiv={eiv.Length}B");
 
             // FairPlay-decrypt the stream key (needs the fp-setup phase-2 key message).
             if (_pairing.FairPlay.KeyMessage is { } keyMessage && ekey.Length == 72)
@@ -446,11 +447,11 @@ public sealed class AirPlaySession : IAsyncDisposable
                 try
                 {
                     _streamAesKey = Playfair.DecryptKey(keyMessage, ekey);
-                    System.Diagnostics.Debug.WriteLine("[Setup] FairPlay stream key unwrapped (16B)");
+                    Log.Info("Setup", "FairPlay stream key unwrapped (16B)");
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[Setup] FairPlay key unwrap failed: {ex.Message}");
+                    Log.Error("Setup", "FairPlay key unwrap failed — mirror decryption key unavailable; video will be BLACK", ex);
                 }
             }
 
@@ -468,7 +469,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             {
                 if (streamObj is not Dictionary<string, object?> stream) continue;
                 long type = stream.TryGetValue("type", out var t) && t is long tl ? tl : -1;
-                System.Diagnostics.Debug.WriteLine($"[Setup] phase 2: stream type={type}");
+                Log.Info("Setup", $"phase 2: stream type={type}");
 
                 if (type == 110) // video mirroring
                 {
@@ -484,16 +485,16 @@ public sealed class AirPlaySession : IAsyncDisposable
                         {
                             var crypto = new MirrorStreamCrypto(aeskey, ecdh, unchecked((ulong)_streamConnectionId));
                             _mirror.Configure(crypto, _decoder);
-                            System.Diagnostics.Debug.WriteLine("[Setup] mirror stream crypto configured");
+                            Log.Info("Setup", "mirror stream crypto configured");
                         }
                         catch (Exception ex)
                         {
-                            System.Diagnostics.Debug.WriteLine($"[Setup] mirror crypto setup failed: {ex.Message}");
+                            Log.Error("Setup", "mirror crypto setup failed — frames cannot be decrypted; video will be BLACK", ex);
                         }
                     }
                     else
                     {
-                        System.Diagnostics.Debug.WriteLine("[Setup] mirror running without decryption (missing key/ecdh)");
+                        Log.Info("Setup", "mirror running without decryption (missing key/ecdh)");
                     }
 
                     _mirror.Start();
@@ -512,13 +513,13 @@ public sealed class AirPlaySession : IAsyncDisposable
                     {
                         long ct  = stream.TryGetValue("ct",  out var ctv)  && ctv  is long ctl  ? ctl  : -1;
                         long spf = stream.TryGetValue("spf", out var spfv) && spfv is long spfl ? spfl : -1;
-                        System.Diagnostics.Debug.WriteLine($"[Setup] phase 2: audio ct={ct} spf={spf}");
+                        Log.Info("Setup", $"phase 2: audio ct={ct} spf={spf}");
 
                         _audio = new AudioStreamReceiver();
                         if (_streamAesKey is { } akey && _streamEiv is { } audioEiv)
                             _audio.Configure(new AudioStreamCrypto(akey, _pairing.EcdhSecret, audioEiv));
                         else
-                            System.Diagnostics.Debug.WriteLine("[Setup] audio without decryption (missing key/eiv)");
+                            Log.Warn("Setup", "audio without decryption (missing key/eiv)");
                         _audio.Start();
                     }
 
@@ -548,7 +549,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         _eventListener.Start();
         int port = ((IPEndPoint)_eventListener.LocalEndpoint).Port;
         _ = AcceptAndDrainEventsAsync(_eventListener);
-        System.Diagnostics.Debug.WriteLine($"[Setup] event channel on TCP {port}");
+        Log.Info("Setup", $"event channel on TCP {port}");
         return port;
     }
 
@@ -577,7 +578,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         // InvalidOperationException — none should escape this fire-and-forget task.
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[Setup] event channel closed: {ex.Message}");
+            Log.Info("Setup", $"event channel closed: {ex.Message}");
         }
     }
 
@@ -588,7 +589,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         _timingCts = new CancellationTokenSource();
         _ = RunTimingChannelAsync(_timingCts.Token);
         int port = ((IPEndPoint)_timing.Client.LocalEndPoint!).Port;
-        System.Diagnostics.Debug.WriteLine($"[Setup] timing channel on UDP {port}");
+        Log.Info("Setup", $"timing channel on UDP {port}");
         return port;
     }
 
@@ -624,7 +625,7 @@ public sealed class AirPlaySession : IAsyncDisposable
             }
         }
         catch (Exception ex) when (ex is OperationCanceledException or SocketException or ObjectDisposedException) { }
-        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[Timing] error: {ex.Message}"); }
+        catch (Exception ex) { Log.Warn("Timing", $"error: {ex.Message}"); }
     }
 
     // .NET ticks for the NTP epoch (1900-01-01 00:00:00 UTC).
@@ -695,7 +696,7 @@ public sealed class AirPlaySession : IAsyncDisposable
                 {
                     float gain = db <= -144f ? 0f : Math.Clamp((float)Math.Pow(10.0, db / 20.0), 0f, 1f);
                     _audio?.SetVolume(gain);
-                    System.Diagnostics.Debug.WriteLine($"[Audio] volume {db:F1} dB → gain {gain:F3}");
+                    Log.Info("Audio", $"volume {db:F1} dB → gain {gain:F3}");
                 }
             }
         }
@@ -710,13 +711,13 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandleTeardown(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine("[RTSP] TEARDOWN received.");
+        Log.Info("RTSP", "TEARDOWN received.");
         return BuildOk(msg.CSeq);
     }
 
     private byte[] HandleGetProperty(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine($"[Video] getProperty {msg.Uri}");
+        Log.Info("Video", $"getProperty {msg.Uri}");
         return BuildOk(msg.CSeq);
     }
 
@@ -724,7 +725,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     private static void LogVideoHeaders(RtspMessage msg)
     {
         string hdrs = string.Join("\n  ", msg.Headers.Select(kv => $"{kv.Key}: {kv.Value}"));
-        System.Diagnostics.Debug.WriteLine($"[Video] {msg.Method} {msg.Uri} headers:\n  {hdrs}");
+        Log.Info("Video", $"{msg.Method} {msg.Uri} headers:\n  {hdrs}");
     }
 
     /// <summary>
@@ -745,7 +746,7 @@ public sealed class AirPlaySession : IAsyncDisposable
                 object? parsed = BinaryPlist.Parse(body);
                 var sb = new StringBuilder();
                 DumpPlist(parsed, sb, 1);
-                System.Diagnostics.Debug.WriteLine($"[Video] setProperty '{prop}' ({body.Length}B):\n{sb}");
+                Log.Info("Video", $"setProperty '{prop}' ({body.Length}B):\n{sb}");
 
                 if (prop.Equals("selectedMediaArray", StringComparison.OrdinalIgnoreCase))
                 {
@@ -753,23 +754,23 @@ public sealed class AirPlaySession : IAsyncDisposable
                     CollectUrls(parsed, urls);
                     if (urls.Count > 0)
                     {
-                        System.Diagnostics.Debug.WriteLine($"[Video] selectedMediaArray URL(s): {string.Join(", ", urls)}");
+                        Log.Info("Video", $"selectedMediaArray URL(s): {string.Join(", ", urls)}");
                         _videoPlayer.Play(urls[0], 0);
                     }
                     else
                     {
-                        System.Diagnostics.Debug.WriteLine("[Video] selectedMediaArray had no http(s) URL — dump above shows what iOS sent");
+                        Log.Warn("Video", "selectedMediaArray had no http(s) URL — dump above shows what iOS sent");
                     }
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[Video] setProperty '{prop}' plist parse failed: {ex.Message}");
+                Log.Warn("Video", $"setProperty '{prop}' plist parse failed: {ex.Message}");
             }
         }
         else
         {
-            System.Diagnostics.Debug.WriteLine($"[Video] setProperty '{prop}' non-plist body ({body.Length}B)");
+            Log.Info("Video", $"setProperty '{prop}' non-plist body ({body.Length}B)");
         }
 
         return Ok(msg);
@@ -791,7 +792,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         int version = body.Length > 4 ? body[4] : -1;
         string note = version == 0x03 ? "v0x03 (should fall back to Legacy)"
                                       : $"v0x{version:X2} — NOT 0x03, playback likely impossible";
-        System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup2 ({body.Length}B, FairPlay {note}) — rejecting 421");
+        Log.Info("Pairing", $"/fp-setup2 ({body.Length}B, FairPlay {note}) — rejecting 421");
 
         var headers = new Dictionary<string, string> { ["Content-Type"] = "application/x-apple-binary-plist" };
         return RtspMessage.BuildResponse(421, "Misdirected Request", msg.CSeq, headers, protocol: msg.Version);

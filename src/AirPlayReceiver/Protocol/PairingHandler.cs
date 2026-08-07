@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using Org.BouncyCastle.Crypto.Agreement;
 using Org.BouncyCastle.Crypto.Engines;
 using Org.BouncyCastle.Crypto.Generators;
@@ -71,7 +72,7 @@ public sealed class PairingHandler
     /// </summary>
     public byte[] HandlePairSetup(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine("[Pairing] /pair-setup → returning 32-byte Ed25519 public key");
+        Log.Info("Pairing", "/pair-setup → returning 32-byte Ed25519 public key");
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
             OctetStreamHeaders(),
             body: _identity.PublicKeyBytes);
@@ -123,7 +124,7 @@ public sealed class PairingHandler
         byte[] encrypted   = AesCtr(_verifyAesKey, _verifyAesIv, signature, skipBytes: 0);
         byte[] responseBody = Concat(_serverCurvePub, encrypted); // 32 + 64 = 96 bytes
 
-        System.Diagnostics.Debug.WriteLine("[Pairing] /pair-verify step 1 → 96-byte response");
+        Log.Info("Pairing", "/pair-verify step 1 → 96-byte response");
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq, OctetStreamHeaders(), responseBody);
     }
 
@@ -132,7 +133,7 @@ public sealed class PairingHandler
         if (_verifyAesKey is null || _verifyAesIv is null ||
             _serverCurvePub is null || _clientCurvePub is null || _clientEdPub is null)
         {
-            System.Diagnostics.Debug.WriteLine("[Pairing] /pair-verify step 2 arrived before step 1");
+            Log.Warn("Pairing", "/pair-verify step 2 arrived before step 1");
             return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq);
         }
 
@@ -145,9 +146,10 @@ public sealed class PairingHandler
         byte[] clientSig = AesCtr(_verifyAesKey, _verifyAesIv, encryptedClientSig, skipBytes: 64);
 
         bool ok = VerifyEd25519(_clientEdPub, Concat(_clientCurvePub, _serverCurvePub), clientSig);
-        System.Diagnostics.Debug.WriteLine(ok
-            ? "[Pairing] /pair-verify step 2 → signature OK, pairing complete"
-            : "[Pairing] /pair-verify step 2 → signature verification FAILED");
+        if (ok)
+            Log.Info("Pairing", "/pair-verify step 2 → signature OK, pairing complete");
+        else
+            Log.Error("Pairing", "/pair-verify step 2 → signature verification FAILED");
 
         // iOS expects an empty 200 OK to finish the handshake either way.
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq, OctetStreamHeaders(), Array.Empty<byte>());
@@ -157,7 +159,7 @@ public sealed class PairingHandler
 
     public byte[] HandlePairAdd(RtspMessage msg)
     {
-        System.Diagnostics.Debug.WriteLine("[Pairing] /pair-add (no-op)");
+        Log.Info("Pairing", "/pair-add (no-op)");
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq);
     }
 
@@ -170,12 +172,11 @@ public sealed class PairingHandler
 
         if (response is null)
         {
-            System.Diagnostics.Debug.WriteLine($"[Pairing] /fp-setup unrecognised (body={body.Length}B)");
+            Log.Warn("Pairing", $"/fp-setup unrecognised (body={body.Length}B)");
             return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq);
         }
 
-        System.Diagnostics.Debug.WriteLine(
-            $"[Pairing] /fp-setup → {response.Length}-byte response (request {body.Length}B)");
+        Log.Info("Pairing", $"/fp-setup → {response.Length}-byte response (request {body.Length}B)");
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq, OctetStreamHeaders(), response);
     }
 
