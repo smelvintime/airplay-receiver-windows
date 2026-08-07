@@ -84,6 +84,26 @@ public sealed class MdnsService : IAsyncDisposable
     // IN so the responder still matches incoming QCLASS=IN questions.
     private const DnsClass CacheFlushIn = (DnsClass)0x8001;
 
+    // ── Record lifetimes ──────────────────────────────────────────────────────
+    //
+    // These are the RFC 6762 §10 lifetimes, and also what real Apple TVs use.
+    //
+    // Makaretu already lands on the same numbers, but by a route worth pinning
+    // down: Makaretu.Dns 2.0.1 declares ResourceRecord.DefaultTTL and
+    // DefaultHostTTL as one DAY, and Makaretu.Dns.Multicast's MulticastService
+    // *static constructor* overwrites both statics with 4500s/120s. Every record
+    // therefore inherits the right TTL — but only if a MulticastService has been
+    // constructed first. Stating the values here removes the dependency on that
+    // static-initialisation order, and gets the effective TTL into the log.
+    private static readonly TimeSpan SharedRecordTtl = TimeSpan.FromSeconds(4500); // PTR/SRV/TXT (75 min)
+    private static readonly TimeSpan HostRecordTtl   = TimeSpan.FromSeconds(120);  // A/AAAA
+
+    // Unsolicited keepalive announcement interval. iOS's mDNSResponder refreshes a
+    // cached record at 80/85/90/95% of its TTL; announcing well inside that window
+    // means the picker entry survives even if a refresh query is lost or never
+    // reaches us. Standard practice for AirPlay receivers.
+    private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(45);
+
     private readonly string     _deviceName;
     private readonly string     _deviceId;   // MAC-style: "AA:BB:CC:DD:EE:FF"
     private readonly int        _port;
@@ -103,6 +123,16 @@ public sealed class MdnsService : IAsyncDisposable
     // exactly once even though several callbacks (mirroring stream start, AirPlay
     // Video activation) can report the same state.
     private int _sessionActive;
+
+    // Keepalive announcement loop; runs for the lifetime of the service.
+    private Task? _keepAlive;
+
+    // Queries seen for our service names, so the log can show whether the
+    // responder is still being asked (and by extension still answering) during and
+    // after a session — the alternative explanation for a device that vanishes
+    // from the picker is that nothing is querying us at all.
+    private long _queriesForUsTotal;
+    private long _queriesForUsWindow;
 
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -124,7 +154,8 @@ public sealed class MdnsService : IAsyncDisposable
 
     public Task StartAsync(CancellationToken ct = default)
     {
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _cts = cts;
 
         // Diagnostics: log which interfaces we bind to and any AirPlay/RAOP
         // queries that arrive, so we can tell whether iOS is reaching us at all.
@@ -138,24 +169,48 @@ public sealed class MdnsService : IAsyncDisposable
 
         // Per-query logging was invaluable while bringing discovery up, but iOS
         // polls these names several times a second, and the noise buries the RTSP
-        // and video logs. Discovery is stable now, so we no longer log every query.
+        // and video logs. Count them instead and report the count once per
+        // keepalive tick — enough to prove the responder is still being reached,
+        // without drowning the log.
+        _mdns.QueryReceived += OnQueryReceived;
 
         RegisterAirPlayService();
         RegisterRaopService();
+        NormaliseRecordTtls();
 
         _mdns.Start();
         _running = true;
 
         Log.Info("mDNS", $"Advertising '{_deviceName}' on port {_port}  deviceid={_deviceId}");
+
+        // Advertise() only fills Makaretu's catalog; nothing goes on the wire until
+        // something asks. Announce up front so the picker learns about us (and so
+        // any stale record iOS cached from an earlier run is flushed) immediately.
+        AnnounceAll("startup");
+
+        _keepAlive = Task.Run(() => KeepAliveLoopAsync(cts.Token));
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Stops advertising. Only reached on real application exit (tray → Exit →
+    /// App.OnExitRequested → AirPlayService.StopAsync); nothing on the session
+    /// teardown path calls this, so the responder keeps answering between sessions.
+    ///
+    /// Deliberately does NOT send a goodbye (TTL=0). Makaretu would do that through
+    /// ServiceDiscovery.Unadvertise, which we never call — and ServiceDiscovery's
+    /// own Dispose doesn't call it either, so no code path can purge the record
+    /// from iOS's cache. Leaving it that way keeps "device vanished from the
+    /// picker" unambiguous: it cannot be us having withdrawn the record.
+    /// </summary>
     public Task StopAsync()
     {
         _running = false;
         _cts?.Cancel();
+        _mdns.QueryReceived -= OnQueryReceived;
         _mdns.Stop();
-        Log.Info("mDNS", "Stopped.");
+        Log.Info("mDNS", $"Stopped. (no goodbye sent; {Interlocked.Read(ref _queriesForUsTotal)} queries " +
+                         "for our names seen this run)");
         return Task.CompletedTask;
     }
 
@@ -284,6 +339,39 @@ public sealed class MdnsService : IAsyncDisposable
     // records are fresh copies, so the catalog's own records (which the responder
     // matches queries against) are never touched.
 
+    /// <summary>
+    /// Belt-and-braces keepalive: re-announces both profiles every
+    /// <see cref="KeepAliveInterval"/> for the lifetime of the service, and reports
+    /// how many queries for our names arrived in that window.
+    ///
+    /// This is cheap (two UDP packets) and safe with Makaretu — SendAnswer with
+    /// checkDuplicate:false does nothing but serialise and send.
+    /// </summary>
+    private async Task KeepAliveLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(KeepAliveInterval, ct);
+
+                long window = Interlocked.Exchange(ref _queriesForUsWindow, 0);
+                long total  = Interlocked.Read(ref _queriesForUsTotal);
+                Log.Info("mDNS",
+                    $"Keepalive: {window} queries for our names in the last {KeepAliveInterval.TotalSeconds:F0}s " +
+                    $"(total {total}), session={(Volatile.Read(ref _sessionActive) == 1 ? "active" : "idle")}");
+
+                AnnounceProfile(_airplayProfile, "keepalive");
+                AnnounceProfile(_raopProfile,    "keepalive");
+            }
+        }
+        catch (OperationCanceledException) { /* shutting down */ }
+        catch (Exception ex)
+        {
+            Log.Error("mDNS", "Keepalive loop stopped", ex);
+        }
+    }
+
     /// <summary>Re-announces both service profiles, twice, one second apart (RFC 6762 §8.3).</summary>
     private void AnnounceAll(string reason)
     {
@@ -328,6 +416,7 @@ public sealed class MdnsService : IAsyncDisposable
             {
                 Name       = profile.QualifiedServiceName,
                 DomainName = profile.FullyQualifiedName,
+                TTL        = SharedRecordTtl,
             });
 
             foreach (ResourceRecord r in profile.Resources)
@@ -376,6 +465,61 @@ public sealed class MdnsService : IAsyncDisposable
         {
             Log.Error("mDNS", $"Announce of {profile.FullyQualifiedName} ({reason}) failed", ex);
         }
+    }
+
+    // ── Responder diagnostics ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Counts (never logs individually — iOS polls several times a second) queries
+    /// that name one of our services. Runs on Makaretu's receive loop, so it must
+    /// never throw.
+    /// </summary>
+    private void OnQueryReceived(object? sender, MessageEventArgs e)
+    {
+        try
+        {
+            foreach (Question q in e.Message.Questions)
+            {
+                string name = q.Name.ToString();
+                if (name.IndexOf("_airplay._tcp", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    name.IndexOf("_raop._tcp",    StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                Interlocked.Increment(ref _queriesForUsTotal);
+                Interlocked.Increment(ref _queriesForUsWindow);
+                return;
+            }
+        }
+        catch { /* diagnostics must never break the responder */ }
+    }
+
+    /// <summary>
+    /// Stamps the RFC 6762 §10 lifetimes on every record Makaretu put in the
+    /// catalog — including the PTRs that <c>Advertise</c> creates for us, which we
+    /// otherwise never see. Called after both profiles are advertised, and logs the
+    /// result so the TTL our records actually carry is on record in every run.
+    ///
+    /// TTL is not part of a record's rdata, so changing it in place does not
+    /// disturb the hashes the catalog's record set is keyed on.
+    /// </summary>
+    private void NormaliseRecordTtls()
+    {
+        int shared = 0, host = 0;
+
+        foreach (var node in _sd.NameServer.Catalog.Values)
+        {
+            foreach (ResourceRecord r in node.Resources)
+            {
+                if (r is AddressRecord) { r.TTL = HostRecordTtl;   host++;   }
+                else                    { r.TTL = SharedRecordTtl; shared++; }
+            }
+        }
+
+        Log.Info("mDNS",
+            $"Record TTLs set: {shared} record(s) at {SharedRecordTtl.TotalSeconds:F0}s, " +
+            $"{host} address record(s) at {HostRecordTtl.TotalSeconds:F0}s " +
+            $"(Makaretu runtime defaults: {ResourceRecord.DefaultTTL.TotalSeconds:F0}s / " +
+            $"{ResourceRecord.DefaultHostTTL.TotalSeconds:F0}s)");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
