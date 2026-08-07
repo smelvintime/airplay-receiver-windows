@@ -80,6 +80,7 @@ public sealed class AirPlayService : IAsyncDisposable
                 if (active) _window?.OnSessionStarted();
                 else        _window?.OnSessionEnded();
                 _presenter?.SetActive(active);
+                _mdns?.SetSessionActive(active);
             });
 
         // ── 2. Video decoder + RTP receiver ───────────────────────────────────
@@ -148,8 +149,10 @@ public sealed class AirPlayService : IAsyncDisposable
 
         // Mirroring frames arrive already upright, so clear any rotation left over
         // from a previous AirPlay Video session before this stream renders.
-        session.StreamStarted += () => { _presenter?.SetRotation(0); _window?.OnSessionStarted(); _presenter?.SetActive(true); };
-        session.StreamStopped += () => { _window?.OnSessionEnded();   _presenter?.SetActive(false); };
+        // The mDNS `flags` advertisement tracks the same start/stop transitions the
+        // window overlay does — a real Apple TV sets ReceiverSessionIsActive here.
+        session.StreamStarted += () => { _presenter?.SetRotation(0); _window?.OnSessionStarted(); _presenter?.SetActive(true);  _mdns?.SetSessionActive(true); };
+        session.StreamStopped += () => { _window?.OnSessionEnded();   _presenter?.SetActive(false); _mdns?.SetSessionActive(false); };
 
         return session;
     }

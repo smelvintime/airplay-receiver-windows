@@ -69,7 +69,20 @@ public sealed class MdnsService : IAsyncDisposable
     // "PIN-less pairing supported") | bit 6 (device supports relay). It is what a
     // real Apple TV 3 advertises while idle, and it matches the `statusFlags`=68
     // this receiver already returns from GET /info.
-    private const string StatusFlagsIdle = "0x44";
+    //
+    // Bit 17 (0x20000) is ReceiverSessionIsActive. Real Apple TVs SET it when a
+    // session starts and CLEAR it when the session ends, re-announcing the record
+    // both times (verified against device dumps: an idle 4K Apple TV advertises
+    // 0x10644 and 0x30e44 while receiving — same bit, different base flags).
+    private const string StatusFlagsIdle   = "0x44";
+    private const string StatusFlagsActive = "0x20044";
+
+    // Cache-flush bit (RFC 6762 §10.2) OR'd into DnsClass.IN. Makaretu has no
+    // first-class support for it, but DnsClass is a ushort enum so the value is
+    // representable. Only ever applied to the record copies we put on the wire in
+    // an announcement — never to the catalog records, whose Class must stay plain
+    // IN so the responder still matches incoming QCLASS=IN questions.
+    private const DnsClass CacheFlushIn = (DnsClass)0x8001;
 
     private readonly string     _deviceName;
     private readonly string     _deviceId;   // MAC-style: "AA:BB:CC:DD:EE:FF"
@@ -78,6 +91,18 @@ public sealed class MdnsService : IAsyncDisposable
     private readonly MulticastService _mdns;
     private readonly ServiceDiscovery _sd;
     private CancellationTokenSource?  _cts;
+
+    // Profiles are kept so their TXT records can be updated and re-announced.
+    private ServiceProfile? _airplayProfile;
+    private ServiceProfile? _raopProfile;
+
+    // Set once MulticastService.Start() has run — sending before that throws.
+    private volatile bool _running;
+
+    // 0 = idle, 1 = a session is active. Interlocked so the transition is applied
+    // exactly once even though several callbacks (mirroring stream start, AirPlay
+    // Video activation) can report the same state.
+    private int _sessionActive;
 
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -119,6 +144,7 @@ public sealed class MdnsService : IAsyncDisposable
         RegisterRaopService();
 
         _mdns.Start();
+        _running = true;
 
         Log.Info("mDNS", $"Advertising '{_deviceName}' on port {_port}  deviceid={_deviceId}");
         return Task.CompletedTask;
@@ -126,10 +152,34 @@ public sealed class MdnsService : IAsyncDisposable
 
     public Task StopAsync()
     {
+        _running = false;
         _cts?.Cancel();
         _mdns.Stop();
         Log.Info("mDNS", "Stopped.");
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Reports whether an AirPlay session is currently receiving, so the advertised
+    /// <c>flags</c> (and the RAOP <c>sf</c> mirror of it) track session state the way
+    /// a real Apple TV's do: bit 17 (ReceiverSessionIsActive) set while a session
+    /// runs, cleared when it ends, with the record re-announced on each transition.
+    ///
+    /// Safe to call repeatedly with the same value and from any thread; only real
+    /// transitions do work.
+    /// </summary>
+    public void SetSessionActive(bool active)
+    {
+        int desired = active ? 1 : 0;
+        if (Interlocked.Exchange(ref _sessionActive, desired) == desired)
+            return;
+
+        string flags = active ? StatusFlagsActive : StatusFlagsIdle;
+        UpdateTxtProperty(_airplayProfile, "flags", flags);
+        UpdateTxtProperty(_raopProfile,    "sf",    flags);
+
+        Log.Info("mDNS", $"Session {(active ? "started" : "ended")} — flags/sf={flags}, re-announcing");
+        AnnounceAll(active ? "session-start" : "session-end");
     }
 
     public async ValueTask DisposeAsync()
@@ -171,6 +221,7 @@ public sealed class MdnsService : IAsyncDisposable
         AddTxt(airplayProfile, "osvers",    AirPlayOsVersion);
         AddTxt(airplayProfile, "vv",        "2");  // vendor version
 
+        _airplayProfile = airplayProfile;
         _sd.Advertise(airplayProfile);
         Log.Info("mDNS",
             $"_airplay._tcp advertised: features={AirPlayFeatures} flags={StatusFlagsIdle} " +
@@ -209,10 +260,122 @@ public sealed class MdnsService : IAsyncDisposable
         AddTxt(raopProfile, "tp",   "UDP");
         AddTxt(raopProfile, "pk",   _publicKeyHex);
 
+        _raopProfile = raopProfile;
         _sd.Advertise(raopProfile);
         Log.Info("mDNS",
             $"_raop._tcp advertised: instance={raopInstance} ft={AirPlayFeatures} " +
             $"sf={StatusFlagsIdle} am={AirPlayModel} vs={AirPlaySrcVers}");
+    }
+
+    // ── Announcement ──────────────────────────────────────────────────────────
+    //
+    // Makaretu's ServiceDiscovery.Announce() is not usable here for two reasons:
+    //
+    //   1. It blocks the calling thread for a full second — it sends the message,
+    //      then does Task.Delay(1000).Wait(), then sends it again. Our callers are
+    //      RTSP/media threads.
+    //   2. It cannot set the cache-flush bit. Without it, an updated TXT record is
+    //      treated by iOS as a *shared* record: the new value is added alongside
+    //      the old one rather than replacing it, and the stale one lingers for the
+    //      remainder of its TTL. That makes a runtime `flags` update pointless.
+    //
+    // Neither is fixable through the 0.27.0 API, so we build the unsolicited
+    // response ourselves and send it through MulticastService.SendAnswer. The
+    // records are fresh copies, so the catalog's own records (which the responder
+    // matches queries against) are never touched.
+
+    /// <summary>Re-announces both service profiles, twice, one second apart (RFC 6762 §8.3).</summary>
+    private void AnnounceAll(string reason)
+    {
+        if (!_running) return;
+
+        // Fire and forget: the caller is a protocol or media thread and must not
+        // wait on the inter-announcement delay.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                AnnounceProfile(_airplayProfile, reason);
+                AnnounceProfile(_raopProfile,    reason);
+
+                await Task.Delay(TimeSpan.FromSeconds(1), _cts?.Token ?? CancellationToken.None);
+
+                AnnounceProfile(_airplayProfile, reason + "/repeat");
+                AnnounceProfile(_raopProfile,    reason + "/repeat");
+            }
+            catch (OperationCanceledException) { /* shutting down */ }
+            catch (Exception ex)
+            {
+                Log.Error("mDNS", $"Re-announce ({reason}) failed", ex);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Sends one unsolicited response describing <paramref name="profile"/>'s current
+    /// records. The service-type PTR is a shared record and must NOT carry the
+    /// cache-flush bit; SRV/TXT/A/AAAA are unique to this instance and must.
+    /// </summary>
+    private void AnnounceProfile(ServiceProfile? profile, string reason)
+    {
+        if (profile is null || !_running) return;
+
+        try
+        {
+            var msg = new Message { QR = true, AA = true };
+
+            msg.Answers.Add(new PTRRecord
+            {
+                Name       = profile.QualifiedServiceName,
+                DomainName = profile.FullyQualifiedName,
+            });
+
+            foreach (ResourceRecord r in profile.Resources)
+            {
+                switch (r)
+                {
+                    case TXTRecord txt:
+                        msg.Answers.Add(new TXTRecord
+                        {
+                            Name    = txt.Name,
+                            // Snapshot: Strings is swapped wholesale on update, so
+                            // this either sees the old list or the new one, never a
+                            // half-written one.
+                            Strings = new List<string>(txt.Strings),
+                            Class   = CacheFlushIn,
+                            TTL     = txt.TTL,
+                        });
+                        break;
+
+                    case SRVRecord srv:
+                        msg.Answers.Add(new SRVRecord
+                        {
+                            Name     = srv.Name,
+                            Priority = srv.Priority,
+                            Weight   = srv.Weight,
+                            Port     = srv.Port,
+                            Target   = srv.Target,
+                            Class    = CacheFlushIn,
+                            TTL      = srv.TTL,
+                        });
+                        break;
+
+                    case AddressRecord addr:
+                        AddressRecord copy = AddressRecord.Create(addr.Name, addr.Address);
+                        copy.Class = CacheFlushIn;
+                        copy.TTL   = addr.TTL;
+                        msg.Answers.Add(copy);
+                        break;
+                }
+            }
+
+            _mdns.SendAnswer(msg, checkDuplicate: false);
+            Log.Info("mDNS", $"Announced {profile.FullyQualifiedName} ({reason}, {msg.Answers.Count} records)");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("mDNS", $"Announce of {profile.FullyQualifiedName} ({reason}) failed", ex);
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -221,6 +384,31 @@ public sealed class MdnsService : IAsyncDisposable
     {
         // ServiceProfile.Resources holds the TXT record; add key=value pairs.
         profile.AddProperty(key, value);
+    }
+
+    /// <summary>
+    /// Rewrites one <c>key=value</c> entry of a profile's TXT record in place.
+    ///
+    /// The TXTRecord object is shared with Makaretu's catalog — the responder
+    /// serialises that very instance when answering a query — so the whole Strings
+    /// list is replaced by a single reference assignment rather than edited item by
+    /// item. A concurrent responder therefore always serialises a complete list.
+    /// </summary>
+    private static void UpdateTxtProperty(ServiceProfile? profile, string key, string value)
+    {
+        if (profile is null) return;
+
+        TXTRecord? txt = profile.Resources.OfType<TXTRecord>().FirstOrDefault();
+        if (txt is null) return;
+
+        string prefix  = key + "=";
+        var    updated = new List<string>(txt.Strings);
+
+        int i = updated.FindIndex(s => s.StartsWith(prefix, StringComparison.Ordinal));
+        if (i >= 0) updated[i] = prefix + value;
+        else        updated.Add(prefix + value);
+
+        txt.Strings = updated;
     }
 
     /// <summary>
