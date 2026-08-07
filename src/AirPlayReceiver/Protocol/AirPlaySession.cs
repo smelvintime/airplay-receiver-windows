@@ -70,6 +70,10 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// </summary>
     public (string SessionId, string Purpose)? ReverseUpgrade { get; private set; }
 
+    // True when this connection is the one that handed a URL to the shared video
+    // player, so its teardown (and only its teardown) stops playback.
+    private bool   _startedVideoPlayback;
+
     // ── AirPlay 2 mirroring media state (set up during SETUP) ─────────────────
     private MirrorStreamReceiver? _mirror;        // TCP video stream
     private AudioStreamReceiver?  _audio;         // UDP/RTP AAC-ELD audio (type 96)
@@ -312,13 +316,14 @@ public sealed class AirPlaySession : IAsyncDisposable
     private byte[] HandlePlay(RtspMessage msg)
     {
         // The /play body carries the video URL. It may be a binary plist
-        // ("Content-Location" + "Start-Position") or a small text body
+        // ("Content-Location" + the start-position keys) or a small text body
         // ("Content-Location: <url>\nStart-Position: <pos>"). Parse both and log
         // everything so we can see exactly what iOS sends.
-        byte[] body  = msg.Body ?? Array.Empty<byte>();
+        byte[] body = msg.Body ?? Array.Empty<byte>();
         string? url  = null;
-        string? uuid = null;      // identifies the playback item across pause/resume
-        double  start = 0;
+        string? uuid = null;         // identifies the playback item across pause/resume
+        double  startSeconds  = 0;   // "Start-Position-Seconds" — absolute seconds
+        double  startFraction = 0;   // legacy "Start-Position"  — 0..1 of the duration
 
         // Full diagnostic dump: headers (X-Apple-Session-ID etc.) + the entire plist,
         // so we can see whether Content-Location is a direct URL or an HLS
@@ -334,15 +339,16 @@ public sealed class AirPlaySession : IAsyncDisposable
                 DumpPlist(dict, dump, 1);
                 Log.Info("Video", $"/play plist ({body.Length}B):\n{dump}");
                 url  = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
-                uuid = dict.TryGetValue("uuid", out var id) ? id as string : null;
+                uuid = dict.TryGetValue("uuid", out var uid) ? uid as string : null;
 
-                // Start-Position-Seconds is absolute seconds and is what iOS sends
-                // for AirPlay video; the legacy Start-Position is a 0..1 fraction
-                // of the duration, which we do not know yet — prefer the former.
-                if (dict.TryGetValue("Start-Position-Seconds", out var sps))
-                    start = sps switch { double d => d, long l => (double)l, _ => 0.0 };
-                else if (dict.TryGetValue("Start-Position", out var sp))
-                    start = sp switch { double d => d, long l => (double)l, _ => 0.0 };
+                // Modern iOS (AirPlay/870+) sends BOTH start keys and they mean
+                // different things: "Start-Position-Seconds" is absolute seconds
+                // (a real capture had 218.135603) while the legacy "Start-Position"
+                // is a 0..1 FRACTION of the duration (0.0 in that same capture).
+                // We used to read the legacy key as seconds, so every resume
+                // restarted the item from 0:00.
+                if (dict.TryGetValue("Start-Position-Seconds", out var sps)) startSeconds  = PlistDouble(sps);
+                if (dict.TryGetValue("Start-Position",         out var sp))  startFraction = PlistDouble(sp);
             }
             else
             {
@@ -353,8 +359,14 @@ public sealed class AirPlaySession : IAsyncDisposable
                     string l = line.Trim();
                     if (l.StartsWith("Content-Location:", StringComparison.OrdinalIgnoreCase))
                         url = l["Content-Location:".Length..].Trim();
+                    else if (l.StartsWith("Start-Position-Seconds:", StringComparison.OrdinalIgnoreCase))
+                        double.TryParse(l["Start-Position-Seconds:".Length..].Trim(),
+                                        System.Globalization.CultureInfo.InvariantCulture, out startSeconds);
                     else if (l.StartsWith("Start-Position:", StringComparison.OrdinalIgnoreCase))
-                        double.TryParse(l["Start-Position:".Length..].Trim(), out start);
+                        double.TryParse(l["Start-Position:".Length..].Trim(),
+                                        System.Globalization.CultureInfo.InvariantCulture, out startFraction);
+                    else if (l.StartsWith("uuid:", StringComparison.OrdinalIgnoreCase))
+                        uuid = l["uuid:".Length..].Trim();
                 }
             }
         }
@@ -369,11 +381,28 @@ public sealed class AirPlaySession : IAsyncDisposable
             return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
         }
 
+        Log.Info("Video", startSeconds > 0
+            ? $"/play start from Start-Position-Seconds = {Inv(startSeconds)}s"
+            : startFraction > 0
+                ? $"/play start from legacy Start-Position fraction {Inv(startFraction)} " +
+                  "(resolved against the duration once the demuxer reports it)"
+                : "/play start from the beginning");
+
+        // Context for whichever route ends up calling the shared player: the
+        // forwarded Cookie/Referer, and this connection's claim on playback so
+        // only its teardown stops it.
+        _videoPlayer.PlayRequestHeaders = ForwardableHeaders(msg);
+        _startedVideoPlayback = true;
+
         // Routing (mlhls/nfhls → FCUP exchange, http(s) → straight to the player,
         // anything else → refuse) lives in HlsCoordinator so the FCUP loop can be
-        // exercised without the RTSP layer.
-        if (!_hls.HandlePlay(_appleSessionId, uuid, url, start))
+        // exercised without the RTSP layer. The legacy fraction only reaches the
+        // direct route — an FCUP item's position is always absolute seconds.
+        if (!_hls.HandlePlay(_appleSessionId, uuid, url, startSeconds, startFraction))
+        {
+            _startedVideoPlayback = false;
             return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
+        }
 
         // An AirPlay-video session and a mirroring session are mutually exclusive:
         // once video-out is accepted, the RTP/NTP/mirror receivers set up during
@@ -384,6 +413,47 @@ public sealed class AirPlaySession : IAsyncDisposable
 
         return Ok(msg);
     }
+
+    /// <summary>
+    /// Hands a URL to the shared player and records that <i>this</i> session owns
+    /// the playback. Ownership matters at teardown: AirPlay Video drives transport
+    /// over many short-lived control connections, and only the one that started
+    /// playback may stop it when it drops (see <see cref="StopStreamAsync"/>).
+    /// </summary>
+    private void StartVideoPlayback(string url, double startSeconds, double startFraction, string? uuid, RtspMessage msg)
+    {
+        _videoPlayer.PlayRequestHeaders = ForwardableHeaders(msg);
+        _startedVideoPlayback = true;
+        _videoPlayer.Play(url, startSeconds, startFraction, uuid);
+    }
+
+    /// <summary>
+    /// Cookie/Referer from the control request, CRLF-joined for FFmpeg's "headers"
+    /// option. Session-scoped CDN URLs 403 without them.
+    /// </summary>
+    private static string? ForwardableHeaders(RtspMessage msg)
+    {
+        var lines = new List<string>();
+        foreach (string name in new[] { "Cookie", "Referer" })
+            if (msg.Headers.TryGetValue(name, out string? v) && !string.IsNullOrWhiteSpace(v))
+                lines.Add($"{name}: {v}");
+        return lines.Count == 0 ? null : string.Join("\r\n", lines);
+    }
+
+    /// <summary>Plist reals arrive as double, ints as long — normalise both.</summary>
+    private static double PlistDouble(object? v) => v switch
+    {
+        double d => d,
+        long   l => l,
+        int    i => i,
+        string s when double.TryParse(s, System.Globalization.NumberStyles.Float,
+                                      System.Globalization.CultureInfo.InvariantCulture, out double p) => p,
+        _ => 0.0,
+    };
+
+    /// <summary>Invariant-culture number text. iOS cannot parse "12,5".</summary>
+    private static string Inv(double v)
+        => v.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
 
     private byte[] HandleRate(RtspMessage msg)
     {
@@ -397,7 +467,11 @@ public sealed class AirPlaySession : IAsyncDisposable
         // POST/PUT sets the position; GET reports it.
         if (msg.Method == "GET")
         {
-            string text = $"duration: {_videoPlayer.Duration}\r\nposition: {_videoPlayer.Position}\r\n";
+            // Invariant culture is not optional here: on a comma-decimal locale
+            // the default interpolation emits "duration: 12,5", which iOS cannot
+            // parse — the scrubber then reads as a zero-length track.
+            string text = $"duration: {Inv(_videoPlayer.Duration)}\r\n" +
+                          $"position: {Inv(_videoPlayer.Position)}\r\n";
             return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
                 new Dictionary<string, string> { ["Content-Type"] = "text/parameters" },
                 Encoding.UTF8.GetBytes(text), protocol: msg.Version);
@@ -496,21 +570,76 @@ public sealed class AirPlaySession : IAsyncDisposable
         return _hls.HandleAction(msg);
     }
 
+    /// <summary>
+    /// iOS polls this a few times a second while an AirPlay Video item is up. Three
+    /// distinct answers, all of them load-bearing:
+    ///
+    ///   • loading  → an <b>empty 200</b> with no Content-Type and no Content-Length.
+    ///     That is how a receiver says "still buffering"; iOS keeps polling.
+    ///   • playing  → the info plist below.
+    ///   • ended/failed → an empty 200 plus <c>Connection: close</c>. There is no
+    ///     "stopped" event in the protocol — the receiver ends an item by dropping
+    ///     the connection. This is what stops the phone spinning on a frozen 0:00
+    ///     after the player has died, which it did on every failure path before.
+    /// </summary>
     private byte[] HandlePlaybackInfo(RtspMessage msg)
     {
-        Log.Info("Video", $"GET /playback-info (ready={_videoPlayer.ReadyToPlay} pos={_videoPlayer.Position:F1} dur={_videoPlayer.Duration:F1})");
+        VideoPlaybackState state    = _videoPlayer.State;
+        double             position = _videoPlayer.Position;
+        double             duration = _videoPlayer.Duration;
+
+        Log.Info("Video", $"GET /playback-info (state={state} pos={Inv(position)} dur={Inv(duration)})");
+
+        if (state is VideoPlaybackState.Idle or VideoPlaybackState.Loading)
+            return RtspMessage.BuildResponse(200, "OK", msg.CSeq, protocol: msg.Version);
+
+        if (state is VideoPlaybackState.Ended or VideoPlaybackState.Failed)
+        {
+            // NOTE: we can only *ask* the client to close — RunAsync (owned by the
+            // reverse/dispatch work) is what would drop the socket on our side.
+            Log.Info("Video", $"playback {state} — empty 200 + Connection: close so the phone stops polling");
+            return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
+                new Dictionary<string, string> { ["Connection"] = "close" }, protocol: msg.Version);
+        }
+
+        // Both range arrays used to be empty, so iOS saw no seekable region at all
+        // and the scrubber was dead. One range each, matching what UxPlay emits.
+        var loadedTimeRanges = new List<object?>
+        {
+            new Dictionary<string, object?>
+            {
+                ["start"]    = position,
+                ["duration"] = duration > position ? duration - position : 0.0,
+            },
+        };
+
+        var seekableTimeRanges = new List<object?>();
+        if (_videoPlayer.CanSeek && duration > 0)
+            seekableTimeRanges.Add(new Dictionary<string, object?>
+            {
+                ["start"]    = 0.0,
+                ["duration"] = duration,
+            });
+
         var info = new Dictionary<string, object?>
         {
-            ["duration"]                = _videoPlayer.Duration,
-            ["position"]                = _videoPlayer.Position,
+            ["duration"]                = duration,
+            ["position"]                = position,
             ["rate"]                    = _videoPlayer.Rate,
-            ["readyToPlay"]             = _videoPlayer.ReadyToPlay,
-            ["playbackBufferEmpty"]     = !_videoPlayer.ReadyToPlay,
+            // Real receivers report readyToPlay=true whenever they answer with a
+            // body at all; "not ready" is the empty 200 above, not a false here.
+            ["readyToPlay"]             = true,
+            ["playbackBufferEmpty"]     = false,
             ["playbackBufferFull"]      = false,
-            ["playbackLikelyToKeepUp"]  = _videoPlayer.ReadyToPlay,
-            ["loadedTimeRanges"]        = new List<object?>(),
-            ["seekableTimeRanges"]      = new List<object?>(),
+            ["playbackLikelyToKeepUp"]  = true,
+            ["loadedTimeRanges"]        = loadedTimeRanges,
+            ["seekableTimeRanges"]      = seekableTimeRanges,
         };
+
+        // TODO(integration): UxPlay answers /playback-info as text/x-apple-plist+xml,
+        // not a binary plist. Flip the writer and this Content-Type together once
+        // Protocol/XmlPlist.cs (branch feat/reverse-channel) lands — changing one
+        // without the other would break a path that currently works.
         return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
             new Dictionary<string, string> { ["Content-Type"] = "application/x-apple-binary-plist" },
             BinaryPlist.Write(info), protocol: msg.Version);
@@ -912,8 +1041,13 @@ public sealed class AirPlaySession : IAsyncDisposable
                                    System.Globalization.CultureInfo.InvariantCulture, out float db))
                 {
                     float gain = db <= -144f ? 0f : Math.Clamp((float)Math.Pow(10.0, db / 20.0), 0f, 1f);
+                    // _audio only exists for screen mirroring. During AirPlay Video
+                    // (URL playback) it is null, so the phone's volume slider used to
+                    // do nothing at all — route it to the video player's own output.
                     _audio?.SetVolume(gain);
-                    Log.Info("Audio", $"volume {db:F1} dB → gain {gain:F3}");
+                    if (_videoPlayer.IsActive) _videoPlayer.SetVolume(gain);
+                    Log.Info("Audio", $"volume {Inv(db)} dB → gain {Inv(gain)} " +
+                                      $"(mirror={_audio is not null}, video={_videoPlayer.IsActive})");
                 }
             }
         }
@@ -958,8 +1092,12 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private byte[] HandleGetProperty(RtspMessage msg)
     {
-        Log.Info("Video", $"getProperty {msg.Uri}");
-        return BuildOk(msg.CSeq);
+        string prop = msg.Uri.Contains('?') ? msg.Uri[(msg.Uri.IndexOf('?') + 1)..] : "(none)";
+        Log.Info("Video", $"getProperty '{prop}' (state={_videoPlayer.State})");
+        // BuildOk hardcodes RTSP/1.0; these arrive as HTTP/1.1 on the video-out
+        // control connections, so echo the request's protocol like every other
+        // video handler does.
+        return Ok(msg);
     }
 
     /// <summary>Dumps a video-out request's headers — the FCUP path keys off X-Apple-Session-ID and friends.</summary>
@@ -991,12 +1129,33 @@ public sealed class AirPlaySession : IAsyncDisposable
 
                 if (prop.Equals("selectedMediaArray", StringComparison.OrdinalIgnoreCase))
                 {
-                    var urls = new List<string>();
-                    CollectUrls(parsed, urls);
-                    if (urls.Count > 0)
+                    var candidates = new List<MediaCandidate>();
+                    CollectUrls(parsed, "", candidates);
+
+                    // The old code took urls[0] from a blind recursive sweep, so a
+                    // thumbnail, poster or ad-tracking pixel — which routinely come
+                    // first — was what FFmpeg tried to open.
+                    MediaCandidate? best = null;
+                    foreach (var c in candidates)
+                        if (c.Score > 0 && (best is null || c.Score > best.Score)) best = c;
+
+                    foreach (var c in candidates)
+                        Log.Info("Video", $"  media candidate {c.KeyPath} score={c.Score} " +
+                                          $"[{(ReferenceEquals(c, best) ? "CHOSEN" : "rejected")}: {c.Reason}] {c.Url}");
+
+                    if (best is not null)
                     {
-                        Log.Info("Video", $"selectedMediaArray URL(s): {string.Join(", ", urls)}");
-                        _videoPlayer.Play(urls[0], 0);
+                        double startSeconds  = FindPlistDouble(parsed, "Start-Position-Seconds");
+                        double startFraction = FindPlistDouble(parsed, "Start-Position");
+                        string? uuid         = FindPlistString(parsed, "uuid");
+                        Log.Info("Video", $"selectedMediaArray → {best.Url} " +
+                                          $"(startSeconds={Inv(startSeconds)} startFraction={Inv(startFraction)} uuid={uuid ?? "(none)"})");
+                        StartVideoPlayback(best.Url, startSeconds, startFraction, uuid, msg);
+                    }
+                    else if (candidates.Count > 0)
+                    {
+                        Log.Warn("Video", $"selectedMediaArray had {candidates.Count} URL(s) but none looked like " +
+                                          "playable media — see the per-candidate reasons above");
                     }
                     else
                     {
@@ -1084,21 +1243,129 @@ public sealed class AirPlaySession : IAsyncDisposable
         _               => v.ToString() ?? "null",
     };
 
-    private static void CollectUrls(object? node, List<string> urls)
+    // ── selectedMediaArray URL selection ──────────────────────────────────────
+
+    /// <summary>One http(s) string found in a media plist, with why we do (not) trust it.</summary>
+    private sealed record MediaCandidate(string Url, string KeyPath, int Score, string Reason);
+
+    private static readonly string[] PlaylistExtensions = { ".m3u8", ".m3u", ".mpd" };
+    private static readonly string[] MediaExtensions =
+        { ".mp4", ".m4v", ".mov", ".ts", ".mkv", ".webm", ".avi", ".3gp", ".m4a", ".mp3", ".aac" };
+    private static readonly string[] ImageExtensions =
+        { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp", ".svg", ".tif", ".tiff" };
+
+    /// <summary>Keys whose values are decoration, never the thing to play.</summary>
+    private static readonly string[] ArtworkKeyHints =
+        { "artwork", "thumb", "image", "poster", "icon", "preview", "logo", "banner", "chapter" };
+
+    /// <summary>Keys that carry analytics/ad beacons — opening one plays nothing.</summary>
+    private static readonly string[] TrackingKeyHints =
+        { "tracking", "beacon", "impression", "advert", "analytics", "metric", "telemetry" };
+
+    /// <summary>Keys that name the actual media, best match first.</summary>
+    private static readonly string[] MediaKeyHints =
+        { "content-location", "contentlocation", "mediaurl", "media-url", "asseturl", "asset-url",
+          "playbackurl", "streamurl", "playlist", "location", "url", "uri" };
+
+    /// <summary>
+    /// Walks a setProperty plist and scores every http(s) string it finds, so the
+    /// caller can pick the media URL rather than whichever URL happened to come
+    /// first. Scoring is deliberately explicit and logged: when a real device sends
+    /// a shape we guessed wrong, the log says exactly what was rejected and why.
+    /// </summary>
+    private static void CollectUrls(object? node, string path, List<MediaCandidate> found)
     {
         switch (node)
         {
             case Dictionary<string, object?> d:
-                foreach (var v in d.Values) CollectUrls(v, urls);
+                foreach (var (k, v) in d) CollectUrls(v, path.Length == 0 ? k : $"{path}.{k}", found);
                 break;
             case List<object?> list:
-                foreach (var v in list) CollectUrls(v, urls);
+                for (int i = 0; i < list.Count; i++) CollectUrls(list[i], $"{path}[{i}]", found);
                 break;
             case string s when s.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                             || s.StartsWith("https://", StringComparison.OrdinalIgnoreCase):
-                urls.Add(s);
+                found.Add(ScoreMediaUrl(s, path));
                 break;
         }
+    }
+
+    private static MediaCandidate ScoreMediaUrl(string url, string keyPath)
+    {
+        string lowerPath = keyPath.ToLowerInvariant();
+
+        foreach (string hint in ArtworkKeyHints)
+            if (lowerPath.Contains(hint))
+                return new MediaCandidate(url, Describe(keyPath), -100, $"key mentions '{hint}' (artwork)");
+
+        foreach (string hint in TrackingKeyHints)
+            if (lowerPath.Contains(hint))
+                return new MediaCandidate(url, Describe(keyPath), -100, $"key mentions '{hint}' (tracking)");
+
+        // Extension comes from the path only — a query string like "?thumb=1.jpg"
+        // must not disqualify a perfectly good .m3u8.
+        string ext = UrlExtension(url);
+        foreach (string image in ImageExtensions)
+            if (ext == image)
+                return new MediaCandidate(url, Describe(keyPath), -100, $"'{ext}' is an image");
+
+        int    score  = 0;
+        string reason;
+        if (Array.IndexOf(PlaylistExtensions, ext) >= 0) { score += 100; reason = $"'{ext}' playlist"; }
+        else if (Array.IndexOf(MediaExtensions, ext) >= 0) { score += 80; reason = $"'{ext}' media file"; }
+        else if (ext.Length == 0) { score += 10; reason = "no extension (redirect or API URL)"; }
+        else { score += 5; reason = $"unknown extension '{ext}'"; }
+
+        for (int i = 0; i < MediaKeyHints.Length; i++)
+            if (lowerPath.Contains(MediaKeyHints[i]))
+            {
+                // Earlier hints are more specific, so they are worth more.
+                int bonus = 60 - i * 4;
+                score += bonus;
+                reason += $" + key '{MediaKeyHints[i]}' (+{bonus})";
+                break;
+            }
+
+        return new MediaCandidate(url, Describe(keyPath), score, reason);
+    }
+
+    /// <summary>The lowercase file extension of a URL's path, or "" when it has none.</summary>
+    private static string UrlExtension(string url)
+    {
+        int cut = url.IndexOfAny(new[] { '?', '#' });
+        string path = cut < 0 ? url : url[..cut];
+        int slash = path.LastIndexOf('/');
+        int dot   = path.LastIndexOf('.');
+        return dot > slash && dot >= 0 ? path[dot..].ToLowerInvariant() : string.Empty;
+    }
+
+    private static string Describe(string keyPath) => keyPath.Length == 0 ? "(root)" : keyPath;
+
+    /// <summary>First value of <paramref name="key"/> anywhere in the plist, as a double (0 when absent).</summary>
+    private static double FindPlistDouble(object? node, string key)
+        => FindPlistValue(node, key) is { } v ? PlistDouble(v) : 0.0;
+
+    /// <summary>First value of <paramref name="key"/> anywhere in the plist, as a string (null when absent).</summary>
+    private static string? FindPlistString(object? node, string key)
+        => FindPlistValue(node, key) as string;
+
+    private static object? FindPlistValue(object? node, string key)
+    {
+        switch (node)
+        {
+            case Dictionary<string, object?> d:
+                foreach (var (k, v) in d)
+                {
+                    if (k.Equals(key, StringComparison.OrdinalIgnoreCase) && v is not null) return v;
+                    if (FindPlistValue(v, key) is { } nested) return nested;
+                }
+                break;
+            case List<object?> list:
+                foreach (var v in list)
+                    if (FindPlistValue(v, key) is { } nested) return nested;
+                break;
+        }
+        return null;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1108,6 +1375,22 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private async Task StopStreamAsync()
     {
+        // AirPlay Video (URL playback) lives on the shared player, not on this
+        // session — but when the phone leaves the network it just drops the socket
+        // instead of sending POST /stop, and FFmpeg would then loop forever on a
+        // stream nobody is watching. Only the session that actually started
+        // playback may end it: video-out drives transport over many short-lived
+        // control connections, and any of the others closing means nothing.
+        if (_startedVideoPlayback)
+        {
+            _startedVideoPlayback = false;
+            if (_videoPlayer.IsActive)
+            {
+                Log.Info("Video", "session teardown — stopping URL playback");
+                _videoPlayer.Stop();
+            }
+        }
+
         if (_isRecording)
         {
             _isRecording = false;

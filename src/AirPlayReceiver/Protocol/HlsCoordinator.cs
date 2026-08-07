@@ -52,7 +52,9 @@ public sealed class HlsCoordinator : IAsyncDisposable
     private const long FcupClientRef  = 40030004;
 
     private readonly ReverseChannelRegistry _channels;
-    private readonly Action<string, double> _onPlay;               // (url, startPositionSeconds)
+    // (url, startPositionSeconds, legacyStartFraction). The fraction is only ever
+    // non-zero on the direct route: an FCUP item's position is always absolute.
+    private readonly Action<string, double, double> _onPlay;
     private readonly Func<double>           _onPauseReportPosition; // pause; returns position in seconds
 
     // RequestID → the playback item the request was issued for. iOS echoes the id
@@ -72,7 +74,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
     /// <param name="onPlay">Starts the player. Called once per item, after every playlist has arrived.</param>
     /// <param name="onPauseReportPosition">Pauses the player and reports where it was, for <c>playlistRemove</c>.</param>
     public HlsCoordinator(ReverseChannelRegistry channels,
-                          Action<string, double> onPlay,
+                          Action<string, double, double> onPlay,
                           Func<double> onPauseReportPosition)
     {
         _channels              = channels;
@@ -135,7 +137,8 @@ public sealed class HlsCoordinator : IAsyncDisposable
     /// immediately (true) and the FCUP exchange, if any, runs in the background —
     /// iOS must get its 200 without waiting for playlists.
     /// </summary>
-    public bool HandlePlay(string? appleSessionId, string? uuid, string? url, double startPositionSeconds)
+    public bool HandlePlay(string? appleSessionId, string? uuid, string? url, double startPositionSeconds,
+                           double legacyStartFraction = 0)
     {
         PlayRoute route = Classify(url);
         Log.Info("HLS", $"/play route={route} url='{url}' uuid={uuid ?? "(none)"} " +
@@ -145,7 +148,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
         switch (route)
         {
             case PlayRoute.Direct:
-                _onPlay(url!, startPositionSeconds);
+                _onPlay(url!, startPositionSeconds, legacyStartFraction);
                 return true;
 
             case PlayRoute.Hls:
@@ -185,7 +188,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
             double at = Math.Max(cached.ResumePositionSeconds, startPositionSeconds);
             Log.Info("HLS", $"Resuming cached item uuid={key} at {at.ToString("F3", CultureInfo.InvariantCulture)}s " +
                             $"— no FCUP round trips needed ({cached.MediaUriCount} playlist(s) already held)");
-            _onPlay(cached.PlaybackLocation, at);
+            _onPlay(cached.PlaybackLocation, at, 0);
             return;
         }
 
@@ -453,7 +456,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
         Log.Info("HLS", $"All {video.MediaUriCount} playlist(s) received for uuid={video.Uuid} — " +
                         $"starting playback at {video.PlaybackLocation} " +
                         $"from {at.ToString("F3", CultureInfo.InvariantCulture)}s");
-        _onPlay(video.PlaybackLocation, at);
+        _onPlay(video.PlaybackLocation, at, 0);
     }
 
     /// <summary>
@@ -544,7 +547,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
             double at = Math.Max(cached.ResumePositionSeconds, start);
             Log.Info("HLS", $"playlistInsert uuid={key} is already cached — switching to it and playing from " +
                             $"{at.ToString("F3", CultureInfo.InvariantCulture)}s with no FCUP round trips");
-            _onPlay(cached.PlaybackLocation, at);
+            _onPlay(cached.PlaybackLocation, at, 0);
             return;
         }
 
@@ -558,7 +561,7 @@ public sealed class HlsCoordinator : IAsyncDisposable
 
             case PlayRoute.Direct:
                 Log.Info("HLS", $"playlistInsert uuid={key} carried a directly fetchable URL — playing it without FCUP: {url}");
-                _onPlay(url!, start);
+                _onPlay(url!, start, 0);
                 break;
 
             default:

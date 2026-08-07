@@ -103,7 +103,10 @@ public sealed class AirPlayService : IAsyncDisposable
                 if (active) _window?.OnSessionStarted();
                 else        _window?.OnSessionEnded();
                 _presenter?.SetActive(active);
-            });
+            },
+            // A URL that won't open (DRM, dead host, 403) used to fail silently and
+            // leave the phone spinning on 0:00 — surface it on the HUD instead.
+            onNotice:     text     => _window?.ShowPersistentNotice(text));
 
         // ── 1b. FCUP/HLS playlist exchange ────────────────────────────────────
         // For YouTube and friends iOS hands us mlhls://localhost/master.m3u8,
@@ -112,7 +115,7 @@ public sealed class AirPlayService : IAsyncDisposable
         // the same player a directly-fetchable URL would have used.
         _hls = new HlsCoordinator(
             channels: _reverseChannels,
-            onPlay:   (url, position) => _videoPlayer!.Play(url, position),
+            onPlay:   (url, seconds, fraction) => _videoPlayer!.Play(url, seconds, fraction),
             onPauseReportPosition: () =>
             {
                 // playlistRemove: iOS is pulling the item (an ad is starting).
