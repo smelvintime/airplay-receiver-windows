@@ -328,7 +328,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// and GET /info. iOS reads all three.
     ///
     /// The features value here is deliberately NOT the 64-bit mDNS mask. UxPlay
-    /// (lib/raop_handlers.h, raop_handler_serverinfo) and apsdk both hardcode
+    /// (lib/http_handlers.h, http_handler_server_info) and apsdk both hardcode
     /// 0x27F — bits 0-6 plus bit 9 — no matter what they advertise over mDNS, and
     /// both are known-working receivers. Reporting the full mirroring mask here
     /// claims AirPlay 2 capabilities this endpoint's consumers don't expect.

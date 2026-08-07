@@ -119,10 +119,12 @@ public sealed class MdnsService : IAsyncDisposable
     // Set once MulticastService.Start() has run — sending before that throws.
     private volatile bool _running;
 
-    // 0 = idle, 1 = a session is active. Interlocked so the transition is applied
-    // exactly once even though several callbacks (mirroring stream start, AirPlay
-    // Video activation) can report the same state.
+    // 0 = idle, 1 = a session is active. Several callbacks (mirroring stream
+    // start, AirPlay Video activation) report the same state, so the transition
+    // must be applied exactly once — and opposite transitions must not interleave,
+    // hence the lock rather than a bare Interlocked exchange.
     private int _sessionActive;
+    private readonly object _sessionFlagLock = new();
 
     // Keepalive announcement loop; runs for the lifetime of the service.
     private Task? _keepAlive;
@@ -225,21 +227,48 @@ public sealed class MdnsService : IAsyncDisposable
     /// </summary>
     public void SetSessionActive(bool active)
     {
-        int desired = active ? 1 : 0;
-        if (Interlocked.Exchange(ref _sessionActive, desired) == desired)
-            return;
+        // The whole transition is serialised, not just the de-duplication: two
+        // call sites drive this (the video player's onActive callback and the
+        // session's StreamStarted/StreamStopped), so a fast start→end→start can
+        // otherwise let opposite transitions interleave and leave the catalog's
+        // live TXT — the record that answers real iOS queries — showing the wrong
+        // state until the next keepalive corrects it.
+        try
+        {
+            lock (_sessionFlagLock)
+            {
+                int desired = active ? 1 : 0;
+                if (_sessionActive == desired) return;
+                _sessionActive = desired;
 
-        string flags = active ? StatusFlagsActive : StatusFlagsIdle;
-        UpdateTxtProperty(_airplayProfile, "flags", flags);
-        UpdateTxtProperty(_raopProfile,    "sf",    flags);
+                string flags = active ? StatusFlagsActive : StatusFlagsIdle;
+                UpdateTxtProperty(_airplayProfile, "flags", flags);
+                UpdateTxtProperty(_raopProfile,    "sf",    flags);
 
-        Log.Info("mDNS", $"Session {(active ? "started" : "ended")} — flags/sf={flags}, re-announcing");
-        AnnounceAll(active ? "session-start" : "session-end");
+                Log.Info("mDNS", $"Session {(active ? "started" : "ended")} — flags/sf={flags}, re-announcing");
+                AnnounceAll(active ? "session-start" : "session-end");
+            }
+        }
+        catch (Exception ex)
+        {
+            // Called synchronously from RTSP/media callbacks; an mDNS bookkeeping
+            // failure must never tear down a live session.
+            Log.Error("mDNS", "Failed to update session flags", ex);
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
+
+        // Let the keepalive loop observe the cancellation and leave AnnounceProfile
+        // before the MulticastService it sends through is disposed underneath it.
+        if (_keepAlive is { } keepAlive)
+        {
+            try { await keepAlive.WaitAsync(TimeSpan.FromSeconds(2)); }
+            catch (Exception ex) { Log.Warn("mDNS", $"Keepalive did not stop cleanly: {ex.GetType().Name}"); }
+        }
+
         _sd.Dispose();
         _mdns.Dispose();
     }
@@ -355,14 +384,26 @@ public sealed class MdnsService : IAsyncDisposable
             {
                 await Task.Delay(KeepAliveInterval, ct);
 
-                long window = Interlocked.Exchange(ref _queriesForUsWindow, 0);
-                long total  = Interlocked.Read(ref _queriesForUsTotal);
-                Log.Info("mDNS",
-                    $"Keepalive: {window} queries for our names in the last {KeepAliveInterval.TotalSeconds:F0}s " +
-                    $"(total {total}), session={(Volatile.Read(ref _sessionActive) == 1 ? "active" : "idle")}");
+                // Per-iteration guard: a single bad tick must not end the loop for
+                // the life of the process. Losing the keepalive silently would
+                // reinstate the exact "device drops out of the picker" failure
+                // this loop exists to prevent.
+                try
+                {
+                    long window = Interlocked.Exchange(ref _queriesForUsWindow, 0);
+                    long total  = Interlocked.Read(ref _queriesForUsTotal);
+                    Log.Info("mDNS",
+                        $"Keepalive: {window} queries for our names in the last {KeepAliveInterval.TotalSeconds:F0}s " +
+                        $"(total {total}), session={(Volatile.Read(ref _sessionActive) == 1 ? "active" : "idle")}");
 
-                AnnounceProfile(_airplayProfile, "keepalive");
-                AnnounceProfile(_raopProfile,    "keepalive");
+                    AnnounceProfile(_airplayProfile, "keepalive");
+                    AnnounceProfile(_raopProfile,    "keepalive");
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    Log.Error("mDNS", "Keepalive tick failed; continuing", ex);
+                }
             }
         }
         catch (OperationCanceledException) { /* shutting down */ }
@@ -449,12 +490,28 @@ public sealed class MdnsService : IAsyncDisposable
                         });
                         break;
 
-                    case AddressRecord addr:
+                }
+            }
+
+            // The host's A/AAAA records are NOT in profile.Resources — Makaretu only
+            // puts them there when a ServiceProfile is constructed with an explicit
+            // address list, and Advertise() doesn't synthesise them either. They live
+            // in the catalog under the SRV target, so pull them from there; otherwise
+            // an address change (DHCP renewal) would never be flushed from iOS's cache.
+            var srvTarget = profile.Resources.OfType<SRVRecord>().FirstOrDefault()?.Target;
+            if (srvTarget is not null)
+            {
+                foreach (var node in _sd.NameServer.Catalog.Values)
+                {
+                    foreach (ResourceRecord r in node.Resources)
+                    {
+                        if (r is not AddressRecord addr || addr.Name != srvTarget) continue;
+
                         AddressRecord copy = AddressRecord.Create(addr.Name, addr.Address);
                         copy.Class = CacheFlushIn;
                         copy.TTL   = addr.TTL;
                         msg.Answers.Add(copy);
-                        break;
+                    }
                 }
             }
 
