@@ -36,6 +36,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     private readonly VideoDecoder?     _decoder;       // mirror video sink (null if FFmpeg absent)
     private readonly AirPlayVideoPlayer _videoPlayer;  // shared AirPlay Video (URL playback) state
     private readonly ReverseChannelRegistry _reverseChannels; // shared receiver→phone (PTTH) channels
+    private readonly HlsCoordinator     _hls;          // shared FCUP/HLS playlist exchange
 
     // Callbacks into the UI layer
     public event Action?         StreamStarted;
@@ -54,6 +55,10 @@ public sealed class AirPlaySession : IAsyncDisposable
     // True once iOS sent TEARDOWN on this connection — the one unambiguous
     // "session is over" signal, and the only one that closes reverse channels.
     private bool _teardownReceived;
+
+    // Set by HandlePlay when an AirPlay-video /play is accepted; the read loop
+    // tears mirroring down after the response is on the wire.
+    private bool _mirroringTeardownPending;
 
     /// <summary>
     /// Set by <see cref="HandleReverse"/> once we answered 101 Switching
@@ -79,7 +84,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     public AirPlaySession(RtpReceiver? rtpReceiver, PairingHandler pairing, DeviceInfo deviceInfo,
                           VideoDecoder? decoder, AirPlayVideoPlayer videoPlayer,
-                          ReverseChannelRegistry reverseChannels)
+                          ReverseChannelRegistry reverseChannels, HlsCoordinator hls)
     {
         _rtpReceiver     = rtpReceiver;
         _pairing         = pairing;
@@ -87,6 +92,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         _decoder         = decoder;
         _videoPlayer     = videoPlayer;
         _reverseChannels = reverseChannels;
+        _hls             = hls;
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -131,6 +137,16 @@ public sealed class AirPlaySession : IAsyncDisposable
 
                 Log.Info("RTSP←", $"{response.Length}B");
                 await stream.WriteAsync(response, ct);
+
+                // A video-out /play makes any mirroring media set up on this
+                // session obsolete. Tearing it down here (rather than inside the
+                // handler) keeps /play's reply immediate and the teardown async.
+                if (_mirroringTeardownPending)
+                {
+                    _mirroringTeardownPending = false;
+                    Log.Info("Video", "AirPlay video accepted — stopping mirroring receivers for this session");
+                    await StopStreamAsync();
+                }
 
                 if (msg.Method == "TEARDOWN")
                 {
@@ -242,8 +258,9 @@ public sealed class AirPlaySession : IAsyncDisposable
         // ("Content-Location" + "Start-Position") or a small text body
         // ("Content-Location: <url>\nStart-Position: <pos>"). Parse both and log
         // everything so we can see exactly what iOS sends.
-        byte[] body = msg.Body ?? Array.Empty<byte>();
-        string? url = null;
+        byte[] body  = msg.Body ?? Array.Empty<byte>();
+        string? url  = null;
+        string? uuid = null;      // identifies the playback item across pause/resume
         double  start = 0;
 
         // Full diagnostic dump: headers (X-Apple-Session-ID etc.) + the entire plist,
@@ -259,8 +276,15 @@ public sealed class AirPlaySession : IAsyncDisposable
                 var dump = new StringBuilder();
                 DumpPlist(dict, dump, 1);
                 Log.Info("Video", $"/play plist ({body.Length}B):\n{dump}");
-                url = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
-                if (dict.TryGetValue("Start-Position", out var sp))
+                url  = dict.TryGetValue("Content-Location", out var u) ? u as string : null;
+                uuid = dict.TryGetValue("uuid", out var id) ? id as string : null;
+
+                // Start-Position-Seconds is absolute seconds and is what iOS sends
+                // for AirPlay video; the legacy Start-Position is a 0..1 fraction
+                // of the duration, which we do not know yet — prefer the former.
+                if (dict.TryGetValue("Start-Position-Seconds", out var sps))
+                    start = sps switch { double d => d, long l => (double)l, _ => 0.0 };
+                else if (dict.TryGetValue("Start-Position", out var sp))
                     start = sp switch { double d => d, long l => (double)l, _ => 0.0 };
             }
             else
@@ -282,10 +306,24 @@ public sealed class AirPlaySession : IAsyncDisposable
             Log.Warn("Video", $"/play parse failed: {ex.Message}");
         }
 
-        if (!string.IsNullOrEmpty(url))
-            _videoPlayer.Play(url!, start);
-        else
+        if (string.IsNullOrEmpty(url))
+        {
             Log.Warn("Video", $"/play had no Content-Location (body={body.Length}B)");
+            return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
+        }
+
+        // Routing (mlhls/nfhls → FCUP exchange, http(s) → straight to the player,
+        // anything else → refuse) lives in HlsCoordinator so the FCUP loop can be
+        // exercised without the RTSP layer.
+        if (!_hls.HandlePlay(_appleSessionId, uuid, url, start))
+            return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
+
+        // An AirPlay-video session and a mirroring session are mutually exclusive:
+        // once video-out is accepted, the RTP/NTP/mirror receivers set up during
+        // SETUP are stale, and leaving them running means two producers fighting
+        // over one presenter (UxPlay tears the same receivers down at raop.c:301).
+        // Deferred until after the 200 is written, so /play still answers at once.
+        _mirroringTeardownPending = true;
 
         return Ok(msg);
     }
@@ -374,8 +412,10 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     /// <summary>
     /// POST /action carries FCUP responses — the iOS device returning HLS playlist
-    /// bytes over the control channel (FCUP_Response_URL / FCUP_Response_Data / …),
-    /// plus other actions. Dump it so we can see the playlist flow.
+    /// bytes over the control channel (FCUP_Response_URL / FCUP_Response_Data / …) —
+    /// plus the playlistInsert/playlistRemove edits iOS uses to splice
+    /// advertisements in and out. <see cref="HlsCoordinator"/> acts on them; the
+    /// dump here is diagnostics only.
     /// </summary>
     private byte[] HandleAction(RtspMessage msg)
     {
@@ -395,7 +435,8 @@ public sealed class AirPlaySession : IAsyncDisposable
         {
             Log.Info("Video", $"/action non-plist body ({body.Length}B)");
         }
-        return Ok(msg);
+
+        return _hls.HandleAction(msg);
     }
 
     private byte[] HandlePlaybackInfo(RtspMessage msg)

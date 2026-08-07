@@ -29,6 +29,11 @@ public sealed class AirPlayService : IAsyncDisposable
     // Constructed in StartAsync once the presenter it renders to exists.
     private AirPlayVideoPlayer? _videoPlayer;
 
+    // Shared FCUP/HLS playlist exchange. Like the reverse channels it cannot live
+    // on a session: /reverse, /play and /action each arrive on their own TCP
+    // connection, and the playlist cache must outlive all of them.
+    private HlsCoordinator? _hls;
+
     // Shared reverse (PTTH) channels, referenced by every session. Lives for the
     // whole app run: an upgraded socket outlives the RTSP connection it arrived on.
     private readonly ReverseChannelRegistry _reverseChannels = new();
@@ -92,6 +97,22 @@ public sealed class AirPlayService : IAsyncDisposable
                 _presenter?.SetActive(active);
             });
 
+        // ── 1b. FCUP/HLS playlist exchange ────────────────────────────────────
+        // For YouTube and friends iOS hands us mlhls://localhost/master.m3u8,
+        // which only the phone can resolve; the coordinator fetches the playlists
+        // over the reverse channel and re-serves them from loopback, then starts
+        // the same player a directly-fetchable URL would have used.
+        _hls = new HlsCoordinator(
+            channels: _reverseChannels,
+            onPlay:   (url, position) => _videoPlayer!.Play(url, position),
+            onPauseReportPosition: () =>
+            {
+                // playlistRemove: iOS is pulling the item (an ad is starting).
+                // Pause and report where we were so the resume lands there.
+                _videoPlayer!.SetRate(0);
+                return _videoPlayer.Position;
+            });
+
         // ── 2. Video decoder + RTP receiver ───────────────────────────────────
         // FFmpeg is optional on first launch: if the native DLLs aren't present
         // (see ARCHITECTURE.md §5) the decoder init throws, but discovery and the
@@ -136,6 +157,7 @@ public sealed class AirPlayService : IAsyncDisposable
         if (_mdns    is not null) await _mdns.StopAsync();
         if (_rtsp    is not null) await _rtsp.StopAsync();
         if (_decoder is not null) await _decoder.StopAsync();
+        if (_hls     is not null) await _hls.DisposeAsync();
 
         // Reverse channels own sockets the RTSP server handed over, so nothing
         // else closes them.
@@ -164,7 +186,7 @@ public sealed class AirPlayService : IAsyncDisposable
     private AirPlaySession CreateSession()
     {
         var pairing = new PairingHandler(_identity!);
-        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!, _reverseChannels);
+        var session = new AirPlaySession(_rtpReceiver, pairing, _deviceInfo!, _decoder, _videoPlayer!, _reverseChannels, _hls!);
 
         // Mirroring frames arrive already upright, so clear any rotation left over
         // from a previous AirPlay Video session before this stream renders.
