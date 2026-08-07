@@ -46,6 +46,35 @@ public sealed class ReverseChannel : IDisposable
     // User-Agent an Apple TV sends on reverse requests; some clients log it.
     private const string UserAgent = "AirPlay/320.20";
 
+    /// <summary>
+    /// Longest X-Apple-Session-ID accepted. A GUID in Apple's textual form is 36
+    /// characters; the slack covers a sender that decorates it.
+    /// </summary>
+    private const int MaxSessionIdLength = 64;
+
+    /// <summary>
+    /// True when a session id is safe to echo into headers we write.
+    ///
+    /// The value arrives on an unauthenticated request and is interpolated
+    /// straight into <see cref="SendAsync"/>'s request head, so what actually
+    /// matters is the character class, not the exact syntax. This is a superset of
+    /// the GUID iOS really sends (hex and dashes) rather than
+    /// <c>Guid.TryParse</c>: a stricter test would silently refuse any sender that
+    /// decorates the id, and we cannot test every sender — but nothing outside
+    /// this class can terminate a header line, introduce a colon, or smuggle a
+    /// control character.
+    /// </summary>
+    public static bool IsValidSessionId(string? sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId) || sessionId.Length > MaxSessionIdLength) return false;
+
+        foreach (char c in sessionId)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c is not ('-' or '_' or '.')) return false;
+        }
+        return true;
+    }
+
     private readonly Stream     _stream;
     private readonly TcpClient? _client;      // null when the channel wraps a plain stream (tests)
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -162,13 +191,19 @@ public sealed class ReverseChannel : IDisposable
             return false;
         }
 
+        // Every interpolated value below goes through HeaderSafe. SessionId and the
+        // path originate in a request from the network, and Encoding.ASCII.GetBytes
+        // passes a CR or LF straight through — so an unsanitised value here is a
+        // header-injection primitive against the phone, not merely a malformed
+        // request. RtspMessage refuses control characters in the first place; this
+        // is the second lock on the same door, at the point where bytes are written.
         var head = new StringBuilder();
-        head.Append(method).Append(' ').Append(path).Append(" HTTP/1.1\r\n");
+        head.Append(method).Append(' ').Append(HeaderSafe(path)).Append(" HTTP/1.1\r\n");
         if (contentType is not null)
-            head.Append("Content-Type: ").Append(contentType).Append("\r\n");
+            head.Append("Content-Type: ").Append(HeaderSafe(contentType)).Append("\r\n");
         head.Append("Content-Length: ").Append(body.Length.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
         head.Append("User-Agent: ").Append(UserAgent).Append("\r\n");
-        head.Append(SessionIdHeader).Append(": ").Append(SessionId).Append("\r\n");
+        head.Append(SessionIdHeader).Append(": ").Append(HeaderSafe(SessionId)).Append("\r\n");
         head.Append("\r\n");
         byte[] headBytes = Encoding.ASCII.GetBytes(head.ToString());
 
@@ -300,6 +335,23 @@ public sealed class ReverseChannel : IDisposable
         Closed?.Invoke(this);
     }
 
+    /// <summary>
+    /// Drops the C0/C1 control characters that could terminate or forge a header
+    /// line on the way out. Tab survives — it is legal inside a field value and
+    /// cannot split one.
+    /// </summary>
+    private static string HeaderSafe(string value)
+    {
+        int bad = 0;
+        foreach (char c in value) if (c != '\t' && char.IsControl(c)) bad++;
+        if (bad == 0) return value;
+
+        var sb = new StringBuilder(value.Length - bad);
+        foreach (char c in value) if (c == '\t' || !char.IsControl(c)) sb.Append(c);
+
+        Log.Warn("Reverse", $"stripped {bad} control character(s) from an outbound header value");
+        return sb.ToString();
+    }
     private static string Preview(byte[] body)
     {
         const int Max = 1200;

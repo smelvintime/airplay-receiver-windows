@@ -541,6 +541,16 @@ public sealed class AirPlaySession : IAsyncDisposable
             return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
         }
 
+        // The id becomes a header we write back to the phone on every FCUP request,
+        // and a registry key. Validate its shape once, here, where the channel is
+        // created — every later use is then working from a checked value.
+        if (!ReverseChannel.IsValidSessionId(sessionId))
+        {
+            Log.Warn("Reverse", $"/reverse {ReverseChannel.SessionIdHeader} is not a plausible session id " +
+                                $"({sessionId.Length} chars) — refusing with 400");
+            return RtspMessage.BuildResponse(400, "Bad Request", msg.CSeq, protocol: msg.Version);
+        }
+
         // One event channel per session (UxPlay answers a second one with 421);
         // a Photos slideshow legitimately opens three "slideshow" channels.
         if (string.Equals(purpose, ReverseChannel.PurposeEvent, StringComparison.OrdinalIgnoreCase) &&
