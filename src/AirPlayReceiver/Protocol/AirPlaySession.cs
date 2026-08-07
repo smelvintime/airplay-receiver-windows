@@ -851,8 +851,13 @@ public sealed class AirPlaySession : IAsyncDisposable
                                    System.Globalization.CultureInfo.InvariantCulture, out float db))
                 {
                     float gain = db <= -144f ? 0f : Math.Clamp((float)Math.Pow(10.0, db / 20.0), 0f, 1f);
+                    // _audio only exists for screen mirroring. During AirPlay Video
+                    // (URL playback) it is null, so the phone's volume slider used to
+                    // do nothing at all — route it to the video player's own output.
                     _audio?.SetVolume(gain);
-                    Log.Info("Audio", $"volume {db:F1} dB → gain {gain:F3}");
+                    if (_videoPlayer.IsActive) _videoPlayer.SetVolume(gain);
+                    Log.Info("Audio", $"volume {Inv(db)} dB → gain {Inv(gain)} " +
+                                      $"(mirror={_audio is not null}, video={_videoPlayer.IsActive})");
                 }
             }
         }
