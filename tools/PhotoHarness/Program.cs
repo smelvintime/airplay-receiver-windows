@@ -346,12 +346,14 @@ internal static class Program
     /// <c>--diag</c>: reproduces the measurement table quoted in
     /// <see cref="PhotoDecoder.AsFullRangeFormat"/>, which is why photos ask
     /// libswscale for the JPEG range conversion through the pixel format rather
-    /// than through <c>sws_setColorspaceDetails</c>. Re-run it after an FFmpeg
-    /// upgrade: if the first row stops reading 16/235 on both paths, the photo
-    /// colour handling needs revisiting.
+    /// than through <c>sws_setColorspaceDetails</c>, and why grayscale needs no
+    /// mapping of its own. Re-run it after an FFmpeg upgrade: if the YUVJ420P or
+    /// GRAY8 row stops reading 16/235 on both paths, the photo colour handling
+    /// needs revisiting.
     /// </summary>
     private static unsafe void Diag()
     {
+        Console.WriteLine($"ffmpeg {ffmpeg.av_version_info()}");
         Console.WriteLine("variant                                    in=0  in=255   (want 16 / 235)");
         foreach (var (name, fmt, details, dstCs) in new (string, AVPixelFormat, bool, int)[]
         {
@@ -360,20 +362,67 @@ internal static class Program
             ("YUV420P,  details dst=BT.709",       AVPixelFormat.AV_PIX_FMT_YUV420P,  true,  ffmpeg.SWS_CS_ITU709),
             ("YUV420P,  details dst=BT.601",       AVPixelFormat.AV_PIX_FMT_YUV420P,  true,  ffmpeg.SWS_CS_ITU601),
             ("YUVJ420P, details dst=BT.709",       AVPixelFormat.AV_PIX_FMT_YUVJ420P, true,  ffmpeg.SWS_CS_ITU709),
+            ("GRAY8,    no setColorspaceDetails",  AVPixelFormat.AV_PIX_FMT_GRAY8,    false, 0),
         })
         {
-            int a = ConvertFlat(0, fmt, details, dstCs);
-            int b = ConvertFlat(255, fmt, details, dstCs);
-            int c = ConvertFlat(0, fmt, details, dstCs, dst: 48);
-            int d = ConvertFlat(255, fmt, details, dstCs, dst: 48);
+            string a = Measure(0,   fmt, details, dstCs, dst: 64);
+            string b = Measure(255, fmt, details, dstCs, dst: 64);
+            string c = Measure(0,   fmt, details, dstCs, dst: 48);
+            string d = Measure(255, fmt, details, dstCs, dst: 48);
             Console.WriteLine($"{name,-42} {a,4}  {b,5}    scaled: {c,4} {d,5}");
         }
+
+        Console.WriteLine();
+        Console.WriteLine("'--'   libswscale did not write the destination at all.");
+        Console.WriteLine("'vary' the same configuration gave different answers on repeated runs,");
+        Console.WriteLine("       so there is no number to record for it.");
     }
 
-    /// <summary>Decodes a flat JPEG and runs one swscale configuration, returning the NV12 centre luma.</summary>
-    private static unsafe int ConvertFlat(byte luma, AVPixelFormat srcFmt, bool setDetails, int dstCs, int dst = 64)
+    /// <summary>
+    /// Runs one configuration several times and reports the value only if it is
+    /// the same every time. The <c>sws_setColorspaceDetails</c> configurations do
+    /// not reproduce on this build — neither between processes nor always within
+    /// one — and a table that quietly writes down whichever answer came back
+    /// first is worse than no table, because the next reader takes it for a
+    /// measurement.
+    /// </summary>
+    private static string Measure(byte luma, AVPixelFormat fmt, bool details, int dstCs, int dst)
     {
-        byte[] jpeg = MakeFlatJpeg(64, 64, luma);
+        string first = ConvertFlat(luma, fmt, details, dstCs, dst);
+        for (int repeat = 0; repeat < MeasureRepeats - 1; repeat++)
+            if (ConvertFlat(luma, fmt, details, dstCs, dst) != first) return "vary";
+        return first;
+    }
+
+    /// <summary>
+    /// How many times each cell is measured before it is believed. This detects
+    /// instability, it cannot prove stability, so the count is set well past the
+    /// point where the answer stops changing: at five repeats the table itself
+    /// still differed between runs, at sixty-four it does not. A 64x64 conversion
+    /// costs microseconds, so the whole sweep is still well under a second.
+    /// </summary>
+    private const int MeasureRepeats = 64;
+
+    /// <summary>
+    /// Pre-fill for the diagnostic's NV12 destination. <c>av_frame_get_buffer</c>
+    /// does not zero its allocation, so without this a configuration libswscale
+    /// declines to run reads back uninitialised heap and prints it as if it were
+    /// a luma value.
+    /// </summary>
+    private const byte SentinelLuma = 0xAA;
+
+    /// <summary>
+    /// Decodes a flat JPEG and runs one swscale configuration, returning the NV12
+    /// centre luma — or "--" when the conversion never happened, which a caller
+    /// must be able to tell apart from a luma value.
+    /// </summary>
+    private static unsafe string ConvertFlat(byte luma, AVPixelFormat srcFmt, bool setDetails, int dstCs, int dst = 64)
+    {
+        // A grayscale source needs a single-component JPEG; every other row of
+        // the table is read out of the ordinary three-component one.
+        byte[] jpeg = srcFmt == AVPixelFormat.AV_PIX_FMT_GRAY8
+            ? MakeGrayJpeg(64, 64, luma)
+            : MakeFlatJpeg(64, 64, luma);
 
         AVCodec* codec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_MJPEG);
         AVCodecContext* ctx = ffmpeg.avcodec_alloc_context3(codec);
@@ -381,33 +430,41 @@ internal static class Program
         AVPacket* pkt = ffmpeg.av_packet_alloc();
         AVFrame* f = ffmpeg.av_frame_alloc();
         fixed (byte* p = jpeg) { pkt->data = p; pkt->size = jpeg.Length; ffmpeg.avcodec_send_packet(ctx, pkt); }
-        ffmpeg.avcodec_receive_frame(ctx, f);
+        int decoded = ffmpeg.avcodec_receive_frame(ctx, f);
 
         SwsContext* sws = ffmpeg.sws_getContext(64, 64, srcFmt, dst, dst,
             AVPixelFormat.AV_PIX_FMT_NV12, ffmpeg.SWS_BILINEAR, null, null, null);
 
+        int details = 0;
         if (setDetails)
         {
             int* s = ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU601);
             int* d = ffmpeg.sws_getCoefficients(dstCs);
             var inv = new int_array4(); var tbl = new int_array4();
             for (uint i = 0; i < 4; i++) { inv[i] = s[i]; tbl[i] = d[i]; }
-            ffmpeg.sws_setColorspaceDetails(sws, in inv, 1, in tbl, 0, 0, 1 << 16, 1 << 16);
+            details = ffmpeg.sws_setColorspaceDetails(sws, in inv, 1, in tbl, 0, 0, 1 << 16, 1 << 16);
         }
 
         AVFrame* nv12 = ffmpeg.av_frame_alloc();
         nv12->format = (int)AVPixelFormat.AV_PIX_FMT_NV12; nv12->width = dst; nv12->height = dst;
         ffmpeg.av_frame_get_buffer(nv12, 32);
+
+        // Stamp the destination so a conversion that never ran cannot masquerade
+        // as a luma reading — see SentinelLuma.
+        for (int y = 0; y < dst; y++)
+            for (int x = 0; x < dst; x++) nv12->data[0][y * nv12->linesize[0] + x] = SentinelLuma;
+
         var dd = new byte_ptrArray4(); dd[0] = nv12->data[0]; dd[1] = nv12->data[1];
         var dl = new int_array4(); dl[0] = nv12->linesize[0]; dl[1] = nv12->linesize[1];
-        ffmpeg.sws_scale(sws, f->data, f->linesize, 0, 64, dd, dl);
+        int rows = ffmpeg.sws_scale(sws, f->data, f->linesize, 0, 64, dd, dl);
 
         int center = nv12->data[0][(dst / 2) * nv12->linesize[0] + dst / 2];
+        bool ran = decoded == 0 && details >= 0 && rows > 0 && center != SentinelLuma;
 
         ffmpeg.sws_freeContext(sws);
         ffmpeg.av_frame_free(&nv12); ffmpeg.av_frame_free(&f);
         ffmpeg.av_packet_free(&pkt); ffmpeg.avcodec_free_context(&ctx);
-        return center;
+        return ran ? center.ToString() : "--";
     }
 
     // ── Assertions ────────────────────────────────────────────────────────────
