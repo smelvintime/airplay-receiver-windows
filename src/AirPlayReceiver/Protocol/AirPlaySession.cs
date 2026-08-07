@@ -61,6 +61,10 @@ public sealed class AirPlaySession : IAsyncDisposable
     // tears mirroring down after the response is on the wire.
     private bool _mirroringTeardownPending;
 
+    // Set when a response carried Connection: close (playback ended or failed).
+    // The read loop drops the socket once that response has been written.
+    private bool _closeAfterResponse;
+
     /// <summary>
     /// Set by <see cref="HandleReverse"/> once we answered 101 Switching
     /// Protocols: this connection is no longer an RTSP request stream, it is a
@@ -158,6 +162,15 @@ public sealed class AirPlaySession : IAsyncDisposable
                 if (msg.Method == "TEARDOWN")
                 {
                     _teardownReceived = true;
+                    break;
+                }
+
+                // Playback ended or failed: we answered Connection: close, so make
+                // it true. Leaving the socket open keeps iOS polling /playback-info
+                // against a player that has nothing left to report.
+                if (_closeAfterResponse)
+                {
+                    Log.Info("Video", "closing the control connection after playback ended");
                     break;
                 }
 
@@ -595,8 +608,12 @@ public sealed class AirPlaySession : IAsyncDisposable
 
         if (state is VideoPlaybackState.Ended or VideoPlaybackState.Failed)
         {
-            // NOTE: we can only *ask* the client to close — RunAsync (owned by the
-            // reverse/dispatch work) is what would drop the socket on our side.
+            // Closing the connection is how a receiver signals "this session is
+            // over" for AirPlay video — there is no stopped event, and UxPlay does
+            // the same (http_handlers.h, set_disconnect(1) on duration == -1).
+            // Asking via the header is not enough: the read loop drops the socket
+            // once this response is on the wire.
+            _closeAfterResponse = true;
             Log.Info("Video", $"playback {state} — empty 200 + Connection: close so the phone stops polling");
             return RtspMessage.BuildResponse(200, "OK", msg.CSeq,
                 new Dictionary<string, string> { ["Connection"] = "close" }, protocol: msg.Version);
