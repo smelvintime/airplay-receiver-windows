@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Loopback harness for the AirPlay Photos path (PUT /photo).
+
+       Links the receiver's protocol and photo sources directly rather than
+       referencing AirPlayReceiver.csproj: that project is a WinUI 3 WinExe, and
+       a console harness must not drag the Windows App SDK in just to exercise
+       an HTTP verb. The files linked below are deliberately free of any WinUI
+       dependency — that is a constraint the photo code is designed to keep. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>AirPlayReceiver.Tools.PhotoHarness</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <AssemblyName>PhotoHarness</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\AirPlayReceiver\Services\Log.cs"           Link="Linked\Log.cs" />
+    <Compile Include="..\..\src\AirPlayReceiver\Protocol\RtspMessage.cs"   Link="Linked\RtspMessage.cs" />
+    <Compile Include="..\..\src\AirPlayReceiver\Protocol\XmlPlist.cs"      Link="Linked\XmlPlist.cs" />
+    <Compile Include="..\..\src\AirPlayReceiver\Protocol\ReverseChannel.cs" Link="Linked\ReverseChannel.cs" />
+    <Compile Include="..\..\src\AirPlayReceiver\Protocol\PhotoCache.cs"    Link="Linked\PhotoCache.cs" />
+    <Compile Include="..\..\src\AirPlayReceiver\Protocol\PhotoHandler.cs"  Link="Linked\PhotoHandler.cs" />
+    <Compile Include="..\..\src\AirPlayReceiver\Media\PhotoDecoder.cs"     Link="Linked\PhotoDecoder.cs" />
+  </ItemGroup>
+
+</Project>

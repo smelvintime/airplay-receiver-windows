@@ -18,12 +18,12 @@ namespace AirPlayReceiver.Media;
 /// rotation reset, fullscreen (F11) and idle-overlay behaviour the video path
 /// already has, and there is exactly one thing that can be "on screen".
 ///
-/// Colour: JPEG is <b>full-range BT.601</b> (JFIF), but the presenter's shader
-/// decodes <b>limited-range BT.709</b> — the same assumption that suits H.264
-/// mirror frames. Handing it raw JPEG luma would wash out blacks and skew hues,
-/// so <see cref="Convert"/> configures libswscale to do the range and matrix
-/// conversion during the NV12 scale. This is the single most likely cause of
-/// "photos look wrong" and costs nothing, since we are scaling anyway.
+/// Colour: JPEG stores luma full-range [0,255], but the presenter's shader
+/// expands from limited-range [16,235] — the assumption that suits H.264 mirror
+/// frames. Handing it raw JPEG luma crushes blacks and blows highlights, so the
+/// NV12 scale also performs the range conversion. Getting libswscale to do that
+/// reliably is subtler than it looks; see <see cref="AsFullRangeFormat"/> for
+/// the measurements behind how it is requested.
 ///
 /// Threading: photos arrive on RTSP session threads (iOS opens several short-
 /// lived connections per session), so every FFmpeg call here is serialised on
@@ -269,38 +269,27 @@ public sealed unsafe class PhotoDecoder : IDisposable
     {
         int srcW = src->width, srcH = src->height;
 
-        // Deprecated YUVJ* pixel formats carry "full range" in the format itself;
-        // libswscale wants the modern format plus an explicit range flag.
-        AVPixelFormat srcFmt = (AVPixelFormat)src->format;
-        bool jpegRange = src->color_range == AVColorRange.AVCOL_RANGE_JPEG;
-        switch (srcFmt)
-        {
-            case AVPixelFormat.AV_PIX_FMT_YUVJ420P: srcFmt = AVPixelFormat.AV_PIX_FMT_YUV420P; jpegRange = true; break;
-            case AVPixelFormat.AV_PIX_FMT_YUVJ422P: srcFmt = AVPixelFormat.AV_PIX_FMT_YUV422P; jpegRange = true; break;
-            case AVPixelFormat.AV_PIX_FMT_YUVJ440P: srcFmt = AVPixelFormat.AV_PIX_FMT_YUV440P; jpegRange = true; break;
-            case AVPixelFormat.AV_PIX_FMT_YUVJ444P: srcFmt = AVPixelFormat.AV_PIX_FMT_YUV444P; jpegRange = true; break;
-            case AVPixelFormat.AV_PIX_FMT_YUVJ411P: srcFmt = AVPixelFormat.AV_PIX_FMT_YUV411P; jpegRange = true; break;
-        }
+        AVPixelFormat srcFmt   = (AVPixelFormat)src->format;
+        AVPixelFormat wireFmt  = AsFullRangeFormat(srcFmt, src->color_range);
+        bool          jpegRange = wireFmt != srcFmt || IsJpegFormat(srcFmt);
 
         (int dstW, int dstH) = FitWithin(srcW, srcH);
 
         if (_sws == null || _swsSrcW != srcW || _swsSrcH != srcH ||
-            _swsDstW != dstW || _swsDstH != dstH || _swsSrcFmt != srcFmt)
+            _swsDstW != dstW || _swsDstH != dstH || _swsSrcFmt != wireFmt)
         {
             ReleaseScaler();
 
             _sws = ffmpeg.sws_getContext(
-                srcW, srcH, srcFmt,
+                srcW, srcH, wireFmt,
                 dstW, dstH, AVPixelFormat.AV_PIX_FMT_NV12,
                 ffmpeg.SWS_BILINEAR, null, null, null);
             if (_sws == null)
             {
                 Log.Error("Photo", $"convert key={assetKey}: sws_getContext failed " +
-                                   $"({srcW}×{srcH} {srcFmt} → {dstW}×{dstH} NV12)");
+                                   $"({srcW}×{srcH} {wireFmt} → {dstW}×{dstH} NV12)");
                 return null;
             }
-
-            ApplyColorConversion(jpegRange, assetKey);
 
             _nv12 = ffmpeg.av_frame_alloc();
             if (_nv12 == null) { Log.Error("Photo", $"convert key={assetKey}: av_frame_alloc failed"); ReleaseScaler(); return null; }
@@ -315,9 +304,10 @@ public sealed unsafe class PhotoDecoder : IDisposable
                 return null;
             }
 
-            _swsSrcW = srcW; _swsSrcH = srcH; _swsDstW = dstW; _swsDstH = dstH; _swsSrcFmt = srcFmt;
+            _swsSrcW = srcW; _swsSrcH = srcH; _swsDstW = dstW; _swsDstH = dstH; _swsSrcFmt = wireFmt;
             Log.Info("Photo", $"scaler {srcW}×{srcH} {srcFmt} " +
-                              $"({(jpegRange ? "full" : "limited")} range) → {dstW}×{dstH} NV12 (limited BT.709)");
+                              $"({(jpegRange ? "full" : "limited")} range, given to swscale as {wireFmt}) " +
+                              $"→ {dstW}×{dstH} NV12 (limited range)");
         }
 
         // sws_scale's destination takes the 4-element array structs while
@@ -341,43 +331,65 @@ public sealed unsafe class PhotoDecoder : IDisposable
     }
 
     /// <summary>
-    /// Tells libswscale to emit limited-range BT.709 — what the presenter's
-    /// NV12→RGB shader decodes — from BT.601 JPEG input. Best-effort: if the
-    /// build refuses the call the photo still displays, just with slightly
-    /// washed-out blacks, so this warns rather than failing the photo.
+    /// Returns the pixel format to hand libswscale so that it performs the
+    /// full-range → limited-range conversion the presenter's shader expects.
+    ///
+    /// This looks like a detail and is not. The shader expands luma from
+    /// [16,235]; JPEG stores it as [0,255]. Skip the conversion and every photo
+    /// shows crushed blacks and blown highlights — the visible half of "photos
+    /// didn't work too well".
+    ///
+    /// The conversion has to be requested through the <b>pixel format</b>, not
+    /// through <c>sws_setColorspaceDetails</c>. Measured on the bundled FFmpeg
+    /// 7.1 build with a flat JPEG (input luma 0 and 255, want 16 and 235):
+    /// <code>
+    ///   source format   colorspace call        unscaled     downscaled
+    ///   YUVJ420P        none                   16 / 235     16 / 235   ✓
+    ///   YUV420P         none                    0 / 255      0 / 255   no conversion
+    ///   YUV420P         src 601 → dst 709      37 / 206     71 / 234   wrong, and size-dependent
+    ///   YUV420P         src 601 → dst 601       0 / 255     16 / 235   size-dependent
+    /// </code>
+    /// Only the format carries the range through both of libswscale's paths: an
+    /// identical source and destination size selects an unscaled plane-copy
+    /// converter that ignores the range flags entirely, so a photo needing no
+    /// downscale would come out different from one that did. The YUVJ formats
+    /// are deprecated and libswscale logs a notice about them; that is the
+    /// price of the only setting that is correct on both paths.
+    ///
+    /// Residual approximation: JPEG is BT.601 while the shader assumes BT.709,
+    /// so hues are very slightly off. libswscale cannot convert a YUV matrix
+    /// without a full RGB round trip (the 601→709 rows above are what that
+    /// attempt actually produces), and the mirror and video paths already feed
+    /// the same shader mixed-matrix content. The range error was the visible
+    /// one; this one is not worth a second render path.
     /// </summary>
-    private void ApplyColorConversion(bool srcFullRange, string assetKey)
+    private static AVPixelFormat AsFullRangeFormat(AVPixelFormat fmt, AVColorRange range)
     {
-        try
+        // Already a JPEG-range format: libswscale reads the range from it.
+        if (IsJpegFormat(fmt)) return fmt;
+
+        // FFmpeg is migrating off YUVJ*, so a JPEG may now decode to a plain
+        // YUV format carrying AVCOL_RANGE_JPEG instead. Map it back to the
+        // deprecated twin, because that is what libswscale still acts on.
+        if (range != AVColorRange.AVCOL_RANGE_JPEG) return fmt;
+
+        return fmt switch
         {
-            int* src601 = ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU601);
-            int* dst709 = ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU709);
-            if (src601 == null || dst709 == null)
-            {
-                Log.Warn("Photo", $"convert key={assetKey}: sws_getCoefficients unavailable — colours may be slightly off");
-                return;
-            }
-
-            var inv = new int_array4();
-            var tbl = new int_array4();
-            for (uint i = 0; i < 4; i++) { inv[i] = src601[i]; tbl[i] = dst709[i]; }
-
-            const int One = 1 << 16;   // libswscale's fixed-point 1.0
-            int ret = ffmpeg.sws_setColorspaceDetails(
-                _sws,
-                in inv, srcFullRange ? 1 : 0,
-                in tbl, 0,                        // destination: limited range, BT.709
-                brightness: 0, contrast: One, saturation: One);
-
-            if (ret < 0)
-                Log.Warn("Photo", $"convert key={assetKey}: sws_setColorspaceDetails failed ({Err(ret)}) — " +
-                                  "photo will display with approximate colours");
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("Photo", $"convert key={assetKey}: colour setup skipped ({ex.GetType().Name}: {ex.Message})");
-        }
+            AVPixelFormat.AV_PIX_FMT_YUV420P => AVPixelFormat.AV_PIX_FMT_YUVJ420P,
+            AVPixelFormat.AV_PIX_FMT_YUV422P => AVPixelFormat.AV_PIX_FMT_YUVJ422P,
+            AVPixelFormat.AV_PIX_FMT_YUV440P => AVPixelFormat.AV_PIX_FMT_YUVJ440P,
+            AVPixelFormat.AV_PIX_FMT_YUV444P => AVPixelFormat.AV_PIX_FMT_YUVJ444P,
+            AVPixelFormat.AV_PIX_FMT_YUV411P => AVPixelFormat.AV_PIX_FMT_YUVJ411P,
+            _                                => fmt,
+        };
     }
+
+    private static bool IsJpegFormat(AVPixelFormat fmt) => fmt
+        is AVPixelFormat.AV_PIX_FMT_YUVJ420P
+        or AVPixelFormat.AV_PIX_FMT_YUVJ422P
+        or AVPixelFormat.AV_PIX_FMT_YUVJ440P
+        or AVPixelFormat.AV_PIX_FMT_YUVJ444P
+        or AVPixelFormat.AV_PIX_FMT_YUVJ411P;
 
     /// <summary>
     /// Largest even-sized box with the source aspect ratio that fits the display
