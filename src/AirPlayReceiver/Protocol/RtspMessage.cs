@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -62,19 +63,28 @@ public sealed class RtspMessage
     public static async Task<RtspMessage?> ReadAsync(
         Stream stream, CancellationToken ct = default)
     {
-        // Read the request/status line + headers (terminated by \r\n\r\n).
+        // Read the request/status line + headers (terminated by a blank line).
         var headerLines = new List<string>();
         var lineBuffer  = new StringBuilder();
 
-        int prev = -1;
         while (true)
         {
             int b = await ReadByteAsync(stream, ct);
             if (b < 0) return null; // EOF
 
-            if (b == '\n' && prev == '\r')
+            // Terminate on ANY \n and strip one optional preceding \r — the same
+            // rule ReverseChannel.ReadLineAsync already uses.
+            //
+            // Requiring CRLF (what this used to do) meant a lone \n fell through to
+            // the else branch and was appended as ordinary data, so
+            // "X-Apple-Session-ID: abc\nX-Evil: 1\r\n" parsed as ONE header whose
+            // value still carried the embedded LF (.Trim() only trims the ends).
+            // That value is written verbatim into the headers we send the phone
+            // (ReverseChannel.SendAsync) and into FFmpeg's "headers" option, so a
+            // bare LF was an outbound header-injection primitive for anything on
+            // the LAN that reached /reverse or /play first.
+            if (b == '\n')
             {
-                // Remove trailing \r
                 if (lineBuffer.Length > 0 && lineBuffer[^1] == '\r')
                     lineBuffer.Length--;
 
@@ -90,8 +100,6 @@ public sealed class RtspMessage
             {
                 lineBuffer.Append((char)b);
             }
-
-            prev = b;
         }
 
         if (headerLines.Count == 0) return null;
@@ -114,6 +122,18 @@ public sealed class RtspMessage
             if (colon < 0) continue;
             string name  = headerLines[i][..colon].Trim();
             string value = headerLines[i][(colon + 1)..].Trim();
+
+            // Belt and braces behind the bare-LF fix above: a stray \r (or any
+            // other C0 control) inside a header still reaches the wire verbatim
+            // when we echo the value onwards, so refuse the whole message rather
+            // than pass a smuggled control character on. No real sender emits one.
+            if (ContainsControlCharacter(name) || ContainsControlCharacter(value))
+            {
+                Log.Error("RTSP", $"{msg.Method} {msg.Uri}: header '{name}' carries a control character " +
+                                  "— refusing the message (header smuggling)");
+                return null;
+            }
+
             msg.Headers[name] = value;
         }
 
@@ -178,6 +198,19 @@ public sealed class RtspMessage
         var buf = new byte[1];
         int n   = await stream.ReadAsync(buf.AsMemory(), ct);
         return n == 0 ? -1 : buf[0];
+    }
+
+    /// <summary>
+    /// True when <paramref name="s"/> holds a C0/C1 control character. Tab is
+    /// allowed: RFC 7230 permits it inside a field value, and it cannot terminate
+    /// a header line on any writer we feed.
+    /// </summary>
+    private static bool ContainsControlCharacter(string s)
+    {
+        foreach (char c in s)
+            if (c != '\t' && (c < ' ' || (c >= '\u007F' && c <= '\u009F')))
+                return true;
+        return false;
     }
 
     public override string ToString()
