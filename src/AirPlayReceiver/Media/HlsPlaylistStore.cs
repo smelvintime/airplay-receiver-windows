@@ -27,6 +27,32 @@ namespace AirPlayReceiver.Media;
 /// </summary>
 public sealed class HlsVideo
 {
+    /// <summary>
+    /// Largest playlist text accepted from the phone, master or child.
+    ///
+    /// Playlists are text and the cache holds up to ten items with several
+    /// playlists each, so an unbounded accept is a way for a sender to park
+    /// memory in the receiver. A very long VOD master with many renditions is
+    /// tens of kilobytes; 4 MB is three orders of magnitude above that.
+    /// </summary>
+    public const int MaxPlaylistChars = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// Ceiling on the number of PARAMS names in a <c>#YT-EXT-CONDENSED-URL</c>
+    /// header. Real YouTube headers carry two or three ("sq,goap"), and every
+    /// name is appended to <i>every</i> chunk line during expansion — so an
+    /// uncapped list is the multiplier in a memory-amplification bomb built from
+    /// a small input.
+    /// </summary>
+    private const int MaxCondensedParams = 32;
+
+    /// <summary>
+    /// Ceiling on the expanded playlist. Expansion grows the input by roughly
+    /// (chunk lines × PARAMS names), so the product is capped as well as each
+    /// factor. A real 10-hour VOD playlist expands to well under a megabyte.
+    /// </summary>
+    private const int MaxExpandedPlaylistChars = 8 * 1024 * 1024;
+
     /// <summary>One cached media (child) playlist, in the order the master listed it.</summary>
     private sealed class MediaItem
     {
@@ -155,6 +181,13 @@ public sealed class HlsVideo
     /// </summary>
     public bool StoreMaster(string rewrittenMaster, IReadOnlyList<string> mediaUris)
     {
+        if (rewrittenMaster.Length > MaxPlaylistChars)
+        {
+            Log.Error("HLS", $"Master playlist for uuid={Uuid} is {rewrittenMaster.Length} chars, over the " +
+                             $"{MaxPlaylistChars} ceiling — refusing it");
+            return false;
+        }
+
         lock (_sync)
         {
             if (MasterPlaylist is not null) return false;
@@ -178,6 +211,8 @@ public sealed class HlsVideo
         AlreadyPresent,
         /// <summary>No slot with that index; the master listed fewer children.</summary>
         OutOfRange,
+        /// <summary>Over <see cref="MaxPlaylistChars"/> — refused before it reaches the cache.</summary>
+        TooLarge,
     }
 
     /// <summary>
@@ -186,6 +221,13 @@ public sealed class HlsVideo
     /// </summary>
     public MediaStoreResult StoreMedia(int index, string playlist, int chunkCount, double duration, bool endList)
     {
+        if (playlist.Length > MaxPlaylistChars)
+        {
+            Log.Error("HLS", $"Media playlist [{index}] for uuid={Uuid} is {playlist.Length} chars, over the " +
+                             $"{MaxPlaylistChars} ceiling — refusing it");
+            return MediaStoreResult.TooLarge;
+        }
+
         lock (_sync)
         {
             if (index < 0 || index >= _media.Count) return MediaStoreResult.OutOfRange;
@@ -368,6 +410,18 @@ public sealed class HlsVideo
 
         string[] names = parms.Length == 0 ? Array.Empty<string>() : parms.Split(',');
 
+        // Output size is roughly (chunk lines × names), and both factors come from
+        // the phone. Cap the multiplier here and the product below, and fail closed
+        // — serving the playlist unexpanded means the CDN 404s every segment, which
+        // is a visible, logged failure, whereas truncating would hand the player a
+        // playlist that is silently half wrong.
+        if (names.Length > MaxCondensedParams)
+        {
+            Log.Error("HLS", $"{Header} header lists {names.Length} PARAMS names, over the {MaxCondensedParams} " +
+                             "ceiling — serving the playlist unexpanded (segments will not resolve)");
+            return playlist;
+        }
+
         var sb = new StringBuilder(playlist.Length + 64);
         int expanded = 0, skipped = 0;
 
@@ -399,6 +453,14 @@ public sealed class HlsVideo
             }
 
             if (i < lines.Length - 1) sb.Append('\n');
+
+            if (sb.Length > MaxExpandedPlaylistChars)
+            {
+                Log.Error("HLS", $"Expanding this playlist passed {MaxExpandedPlaylistChars} chars at line {i} of " +
+                                 $"{lines.Length} (PARAMS=\"{parms}\") — serving it unexpanded rather than " +
+                                 "building an oversized playlist");
+                return playlist;
+            }
         }
 
         Log.Info("HLS", $"Expanded YT-condensed playlist: {expanded} chunk URI(s) " +

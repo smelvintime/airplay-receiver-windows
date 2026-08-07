@@ -491,6 +491,10 @@ public sealed class HlsCoordinator : IAsyncDisposable
                 Log.Warn("HLS", $"Media playlist [{index}] {url} was already cached — keeping the copy we have");
                 return false;
 
+            case HlsVideo.MediaStoreResult.TooLarge:
+                // Already logged with the sizes by the store; nothing to add.
+                return false;
+
             default:
                 Log.Error("HLS", $"Media playlist for {url} has no slot at index {index} " +
                                  $"(the master listed {video.MediaUriCount}) — dropping it");
