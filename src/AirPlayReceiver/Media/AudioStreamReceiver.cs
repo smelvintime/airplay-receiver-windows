@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using System;
 using System.Net;
 using System.Net.Sockets;
@@ -51,9 +52,9 @@ public sealed class AudioStreamReceiver : IAsyncDisposable
 
     public void Start()
     {
-        _data    = new UdpClient(0);
+        _data    = DualStackSockets.CreateUdpClient(0);
         DataPort = ((IPEndPoint)_data.Client.LocalEndPoint!).Port;
-        _control = new UdpClient(0);
+        _control = DualStackSockets.CreateUdpClient(0);
         ControlPort = ((IPEndPoint)_control.Client.LocalEndPoint!).Port;
 
         // FFmpeg/NAudio init can fail (missing DLLs, no audio device). Guard it so a

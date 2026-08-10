@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using System;
 using System.Buffers;
 using System.Net;
@@ -77,7 +78,7 @@ public sealed class RtpReceiver : IAsyncDisposable
     public Task StartAsync()
     {
         _cts      = new CancellationTokenSource();
-        _udpData  = new UdpClient(VideoDataPort);
+        _udpData  = DualStackSockets.CreateUdpClient(VideoDataPort);
 
         System.Diagnostics.Debug.WriteLine($"[RTP] Listening on UDP {VideoDataPort}");
 

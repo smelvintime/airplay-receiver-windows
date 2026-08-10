@@ -3,30 +3,39 @@
 Turn a Windows 10/11 PC into an AirPlay screen-mirroring target, so an iPhone or
 iPad can mirror to it from Control Center.
 
-> **Status: work in progress.** The app builds, launches, and advertises itself
-> on your network, so your iPhone will find it under Screen Mirroring. Parts of
-> the pairing crypto and RTP decryption are still stubs, so a real session may
-> not display video yet. Treat this as a preview, not a finished product.
+> **Status: preview.** Screen mirroring works — video and audio both play, and
+> AirPlay Video (playing a URL from an app) is supported too. Expect rough
+> edges: the app isn't code signed yet, and jitter/resend handling for audio is
+> still basic.
 
 ## Download and run
 
-1. Go to the [**Releases** page](../../releases) and download
-   `AirPlayReceiver-win-x64.zip` from the newest release.
-2. Right-click the zip → **Extract All**.
-3. Open the extracted folder and run **`AirPlayReceiver.exe`**.
-4. Windows SmartScreen will warn that the app is unrecognized (it isn't code
+Go to the [**Releases** page](../../releases) and pick the newest release.
+Depending on the release it carries one or both of these:
+
+- **`AirPlayReceiverSetup.exe`** — the installer. Download, run it, and launch
+  **AirPlay Receiver** from the Start menu. This is what the current releases
+  (1.0.0 and 1.1.0) ship.
+- **`AirPlayReceiver-win-x64.zip`** — the portable build produced by the
+  release workflow. Right-click → **Extract All**, then run
+  **`AirPlayReceiver.exe`** from the extracted folder (don't run it from inside
+  the zip). No installer and no .NET install needed — it's self-contained.
+
+Either way, on first launch:
+
+1. Windows SmartScreen will warn that the app is unrecognized (it isn't code
    signed). Click **More info** → **Run anyway**.
-5. Windows Firewall will prompt on first launch — **allow access on Private
-   networks**. The receiver needs UDP 5353, TCP 7000, and UDP 7011, and it
-   won't be discoverable if you decline.
-6. On your iPhone: open Control Center → **Screen Mirroring** → pick your PC.
+2. Windows Firewall will prompt — **allow access on Private networks**. The
+   receiver listens on UDP 5353 (discovery), TCP 7000 (control), and UDP 7011
+   (video), plus a few per-session ports the firewall allow covers. It won't be
+   discoverable if you decline.
+3. On your iPhone: open Control Center → **Screen Mirroring** → pick your PC.
 
-No installer and no .NET install are needed — the zip is self-contained. Press
-**F11** or double-click the window to toggle fullscreen.
+Press **F11** or double-click the window to toggle fullscreen.
 
-### If there are no releases yet
+### If a release is missing the zip
 
-Every run of the build workflow also leaves a downloadable zip attached to it:
+Every run of the build workflow leaves a downloadable zip attached to it:
 open the [**Actions** tab](../../actions/workflows/release.yml), click the most
 recent successful run, and grab `AirPlayReceiver-win-x64` under **Artifacts**.
 (Downloading Actions artifacts requires being signed in to GitHub.)
@@ -34,16 +43,36 @@ recent successful run, and grab `AirPlayReceiver-win-x64` under **Artifacts**.
 ## Requirements
 
 - Windows 10 version 1809 (build 17763) or newer, 64-bit
-- The PC and the iPhone/iPad on the **same Wi-Fi network and subnet**
+- The PC and the iPhone/iPad on the **same network and subnet** (see below)
+
+## How devices connect
+
+AirPlay runs over your local IP network — there is no Bluetooth involved, so
+the PC needs no Bluetooth hardware and pairing happens automatically over the
+network. Any of these setups work:
+
+- **Wi-Fi** — PC and iPhone on the same Wi-Fi network (the usual setup).
+- **Ethernet** — the PC can be wired to the same router the iPhone's Wi-Fi
+  hangs off; wired + wireless on one subnet is fine.
+- **Windows Mobile Hotspot** — no router? Turn on **Settings → Network &
+  internet → Mobile hotspot** on the PC and join the iPhone to it. The
+  receiver listens on the hotspot adapter too.
+
+The receiver accepts connections over both **IPv4 and IPv6** on every network
+adapter. Discovery uses mDNS/Bonjour (UDP 5353), control uses Apple's RTSP
+dialect (TCP 7000), and the media streams follow on ports negotiated per
+session. Apple's Bluetooth-assisted "peer-to-peer AirPlay" (mirroring without
+a shared network, as an Apple TV can) relies on Apple-proprietary hardware
+support and is not possible on a Windows PC.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| PC doesn't appear under Screen Mirroring | Same Wi-Fi network? Firewall allowed for Private networks? Some guest/corporate networks block mDNS between devices. |
+| PC doesn't appear under Screen Mirroring | Same network and subnet? Firewall allowed for Private networks? Some guest/corporate networks block mDNS between devices — the Mobile Hotspot setup above sidesteps that. |
 | "Windows protected your PC" | SmartScreen — click **More info** → **Run anyway**. |
-| App closes right away | Check that you extracted the whole zip rather than running the exe from inside it. |
-| Connects, but no video | Expected for now — see the status note above. |
+| App closes right away | If you used the zip, check that you extracted the whole thing rather than running the exe from inside it. |
+| Connects, but no video | Make sure you're on the newest release — old previews couldn't decrypt the stream yet. |
 
 ## Building from source
 
@@ -53,12 +82,15 @@ together.
 
 ## Releasing
 
-Pushing a tag that starts with `v` builds the app and publishes a release with
-the zip attached:
+Pushing a version tag builds the app and publishes a release with the portable
+zip attached. Both `v`-prefixed and bare tags work (existing releases use the
+bare form):
 
 ```
-git tag v0.1.0
-git push origin v0.1.0
+git tag 1.2.0
+git push origin 1.2.0
 ```
 
-The same workflow can be run manually from the Actions tab.
+If a release for the tag already exists (e.g. one created by hand with the
+installer attached), the workflow adds the zip to it instead of creating a new
+one. The same workflow can also be run manually from the Actions tab.

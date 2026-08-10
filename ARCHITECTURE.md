@@ -1,5 +1,14 @@
 # AirPlay Receiver for Windows — Architecture Blueprint
 
+> **Note:** this is the original design blueprint, kept for the protocol
+> references and rationale. The implementation has evolved past it in places —
+> most notably, AirPlay 2 mirroring video actually arrives over a **TCP**
+> stream (`Media/MirrorStreamReceiver.cs`, AES-128-CTR) rather than RTP/UDP
+> 7011, mirroring audio arrives separately as AAC-ELD over UDP/RTP
+> (`Media/AudioStreamReceiver.cs`), and all listeners are dual-stack
+> (IPv4 + IPv6, `Services/DualStackSockets.cs`). The source now lives in
+> `Services/`, `Protocol/`, `Media/`, and `Rendering/` folders.
+
 ## Table of Contents
 1. [Technology Stack Decision](#1-technology-stack-decision)
 2. [Architecture Overview](#2-architecture-overview)
