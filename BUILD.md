@@ -57,11 +57,35 @@ networks**, since the receiver needs:
 > plays audio. Without them, this first run still verifies the app builds,
 > launches, and advertises itself on the network.
 
+## 6. Building the installer (optional)
+
+Releases ship `AirPlayReceiverSetup.exe`, built from
+[`installer/AirPlayReceiver.iss`](installer/AirPlayReceiver.iss) with
+[Inno Setup 6](https://jrsoftware.org/isdl.php). CI does this automatically on a
+version tag; to reproduce it locally, publish the app and then compile the
+script:
+
+```
+dotnet publish src/AirPlayReceiver/AirPlayReceiver.csproj -c Release -r win-x64 ^
+  --self-contained true -p:Platform=x64 -p:WindowsPackageType=None -o publish
+
+iscc /DAppVersion=1.2.0 installer\AirPlayReceiver.iss
+```
+
+That writes `AirPlayReceiverSetup.exe` to the repository root. The script takes
+optional `/DPublishDir=` and `/DOutputDir=` defines if your paths differ.
+
+The installer requires admin rights: it installs to Program Files and adds the
+inbound Windows Firewall rules for the receiver, so users don't have to answer
+the firewall prompt. Uninstalling removes those rules and the launch-at-sign-in
+entry.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
 | Build error: platform `Any CPU` not supported | Switch the platform dropdown to **x64**. |
+| `iscc` not recognised | Install [Inno Setup 6](https://jrsoftware.org/isdl.php) and add its folder (e.g. `C:\Program Files (x86)\Inno Setup 6`) to `PATH`. |
 | `DllNotFoundException` for `avcodec-61` at runtime | Add the FFmpeg DLLs (step 2); they must sit in `native/x64/` next to the build output. |
 | Device doesn't appear in iPhone Screen Mirroring | Confirm both devices are on the same subnet and the firewall prompt was allowed for Private networks. |
 | App closes immediately | Run with the debugger (F5) and check the Output window for the startup exception. |

@@ -10,36 +10,36 @@ iPad can mirror to it from Control Center.
 
 ## Download and run
 
-Go to the [**Releases** page](../../releases) and pick the newest release.
-Depending on the release it carries one or both of these:
+Go to the [**Releases** page](../../releases), pick the newest release, and take
+either download — they're the same app:
 
-- **`AirPlayReceiverSetup.exe`** — the installer. Download, run it, and launch
-  **AirPlay Receiver** from the Start menu. This is what the current releases
-  (1.0.0 and 1.1.0) ship.
-- **`AirPlayReceiver-win-x64.zip`** — the portable build produced by the
-  release workflow. Right-click → **Extract All**, then run
-  **`AirPlayReceiver.exe`** from the extracted folder (don't run it from inside
-  the zip). No installer and no .NET install needed — it's self-contained.
+- **`AirPlayReceiverSetup.exe`** — the installer. **Recommended:** it adds a
+  Start-menu entry and an uninstaller, and pre-approves the receiver in Windows
+  Firewall so there's no prompt to get wrong. Needs admin rights.
+- **`AirPlayReceiver-win-x64.zip`** — portable, no install. Right-click →
+  **Extract All**, then run **`AirPlayReceiver.exe`** from the extracted folder
+  (don't run it from inside the zip). No .NET install needed — it's
+  self-contained.
 
-Either way, on first launch:
+Then:
 
 1. Windows SmartScreen will warn that the app is unrecognized (it isn't code
    signed). Click **More info** → **Run anyway**.
-2. Windows Firewall will prompt — **allow access on Private networks**. The
-   receiver listens on UDP 5353 (discovery), TCP 7000 (control), and UDP 7011
-   (video), plus a few per-session ports the firewall allow covers. It won't be
-   discoverable if you decline.
+2. **Zip only:** Windows Firewall prompts on first launch — **allow access on
+   Private networks**. The receiver listens on UDP 5353 (discovery), TCP 7000
+   (control), and UDP 7011 (video), plus a few per-session ports. It won't be
+   discoverable if you decline. The installer sets these rules up for you.
 3. On your iPhone: open Control Center → **Screen Mirroring** → pick your PC.
    Not sure which entry is yours? The receiver window shows the exact name it
    advertises ("Discoverable in Screen Mirroring as …").
 
 Press **F11** or double-click the window to toggle fullscreen.
 
-### If a release is missing the zip
+### If a release is missing a download
 
-Every run of the build workflow leaves a downloadable zip attached to it:
-open the [**Actions** tab](../../actions/workflows/release.yml), click the most
-recent successful run, and grab `AirPlayReceiver-win-x64` under **Artifacts**.
+Every run of the build workflow leaves both files attached to it: open the
+[**Actions** tab](../../actions/workflows/release.yml), click the most recent
+successful run, and grab `AirPlayReceiver-win-x64` under **Artifacts**.
 (Downloading Actions artifacts requires being signed in to GitHub.)
 
 ## Requirements
@@ -84,15 +84,20 @@ together.
 
 ## Releasing
 
-Pushing a version tag builds the app and publishes a release with the portable
-zip attached. Both `v`-prefixed and bare tags work (existing releases use the
-bare form):
+Pushing a version tag builds the app and publishes a release with both
+`AirPlayReceiverSetup.exe` and `AirPlayReceiver-win-x64.zip` attached. Both
+`v`-prefixed and bare tags work (existing releases use the bare form):
 
 ```
 git tag 1.2.0
 git push origin 1.2.0
 ```
 
-If a release for the tag already exists (e.g. one created by hand with the
-installer attached), the workflow adds the zip to it instead of creating a new
-one. The same workflow can also be run manually from the Actions tab.
+The tag name becomes the installer's version in Programs & Features. If a
+release for the tag already exists, the workflow adds the files to it instead of
+creating a new one. The same workflow can also be run manually from the Actions
+tab.
+
+The installer is built with [Inno Setup](https://jrsoftware.org/isinfo.php) from
+[`installer/AirPlayReceiver.iss`](installer/AirPlayReceiver.iss) — see
+[BUILD.md](BUILD.md) to build it locally.
