@@ -35,6 +35,15 @@
                 Width="80"
                 Height="80"
                 Opacity="0.6" />
+            <!-- Caption revealed once the advertised name is known (SetDeviceName) -->
+            <TextBlock
+                x:Name="DiscoverableAsText"
+                Margin="0,0,0,-8"
+                HorizontalAlignment="Center"
+                FontSize="12"
+                Foreground="#FF888888"
+                Text="Discoverable in Screen Mirroring as"
+                Visibility="Collapsed" />
             <TextBlock
                 x:Name="DeviceNameText"
                 HorizontalAlignment="Center"

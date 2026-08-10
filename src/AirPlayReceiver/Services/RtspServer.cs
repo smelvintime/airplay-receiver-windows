@@ -47,10 +47,10 @@ public sealed class RtspServer : IAsyncDisposable
     public Task StartAsync(CancellationToken ct = default)
     {
         _cts      = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _listener = new TcpListener(IPAddress.Any, _port);
+        _listener = DualStackSockets.CreateTcpListener(_port);
         _listener.Start(backlog: 4);
 
-        System.Diagnostics.Debug.WriteLine($"[RTSP] Listening on 0.0.0.0:{_port}");
+        System.Diagnostics.Debug.WriteLine($"[RTSP] Listening on {_listener.LocalEndpoint}");
 
         _acceptLoop = AcceptLoopAsync(_cts.Token);
         return Task.CompletedTask;

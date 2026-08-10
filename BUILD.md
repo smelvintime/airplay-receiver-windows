@@ -15,14 +15,15 @@ Install **Visual Studio 2022 (17.8 or newer)** with these workloads/components:
 
 ## 2. (Optional for first launch) Add the FFmpeg DLLs
 
-Video decoding needs the native FFmpeg 6.x DLLs. They are intentionally **not**
+Video decoding needs the native FFmpeg 7.x DLLs. They are intentionally **not**
 committed (see `.gitignore`). Without them the app still launches and is
 discoverable — it just can't decode video and shows a notice in the HUD.
 
 To enable decoding:
 
-1. Download `ffmpeg-n6.x-win64-gpl-shared` from
-   <https://github.com/BtbN/FFmpeg-Builds/releases>.
+1. Download an `ffmpeg-n7.1-...-win64-gpl-shared` build from
+   <https://github.com/BtbN/FFmpeg-Builds/releases> (7.x is required — an 8.x
+   build's `avcodec-62` DLLs won't bind to the pinned `FFmpeg.AutoGen` 7.1.x).
 2. Copy these DLLs into `src/AirPlayReceiver/native/x64/`:
    `avcodec-61.dll`, `avdevice-61.dll`, `avfilter-10.dll`, `avformat-61.dll`,
    `avutil-59.dll`, `postproc-58.dll`, `swresample-5.dll`, `swscale-8.dll`.
@@ -52,10 +53,9 @@ networks**, since the receiver needs:
 - Press **F11** or double-click to toggle borderless fullscreen.
 - If the FFmpeg DLLs are missing, a HUD line notes that decoding is unavailable.
 
-> **Current limitations:** pairing crypto, NV12→RGB rendering, and RTP
-> decryption are still stubs (see the PR description and `ARCHITECTURE.md §4`),
-> so a real mirroring session won't display video yet. This first run verifies
-> the app builds, launches, and advertises itself on the network.
+> With the FFmpeg DLLs in place, a real mirroring session displays video and
+> plays audio. Without them, this first run still verifies the app builds,
+> launches, and advertises itself on the network.
 
 ## Troubleshooting
 

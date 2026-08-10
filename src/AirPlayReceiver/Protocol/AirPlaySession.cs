@@ -1,4 +1,5 @@
 using AirPlayReceiver.Media;
+using AirPlayReceiver.Services;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -544,7 +545,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// <summary>Opens a TCP listener for the iOS event channel that accepts and drains (we don't act on events yet).</summary>
     private int OpenEventChannel()
     {
-        _eventListener = new TcpListener(IPAddress.Any, 0);
+        _eventListener = DualStackSockets.CreateTcpListener(0);
         _eventListener.Start();
         int port = ((IPEndPoint)_eventListener.LocalEndpoint).Port;
         _ = AcceptAndDrainEventsAsync(_eventListener);
@@ -584,7 +585,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// <summary>Opens the UDP timing channel, reports its port to iOS, and starts the NTP response loop.</summary>
     private int OpenTimingChannel()
     {
-        _timing    = new UdpClient(0);
+        _timing    = DualStackSockets.CreateUdpClient(0);
         _timingCts = new CancellationTokenSource();
         _ = RunTimingChannelAsync(_timingCts.Token);
         int port = ((IPEndPoint)_timing.Client.LocalEndPoint!).Port;

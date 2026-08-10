@@ -1,3 +1,4 @@
+using AirPlayReceiver.Services;
 using System;
 using System.Net;
 using System.Net.Sockets;
@@ -48,7 +49,7 @@ public sealed class MirrorStreamReceiver : IAsyncDisposable
     public void Start()
     {
         _cts = new CancellationTokenSource();
-        _listener = new TcpListener(IPAddress.Any, 0);
+        _listener = DualStackSockets.CreateTcpListener(0);
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
 
