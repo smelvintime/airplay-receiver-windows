@@ -1,9 +1,11 @@
 name: Build & Release
 
-# Produces a ready-to-run, zipped Windows build so people can just download it
-# instead of installing Visual Studio. Runs on version tags with or without a
-# `v` prefix (v0.1.0 and 1.1.0 alike — existing releases use the bare form),
-# and can also be started by hand from the Actions tab.
+# Produces both download options so people don't need Visual Studio:
+#   AirPlayReceiverSetup.exe      — installer (Start-menu entry + uninstaller)
+#   AirPlayReceiver-win-x64.zip   — portable, self-contained folder
+# Runs on version tags with or without a `v` prefix (v0.1.0 and 1.1.0 alike —
+# existing releases use the bare form), and can also be started by hand from
+# the Actions tab.
 on:
   push:
     tags:
@@ -49,16 +51,45 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path publish/* -DestinationPath AirPlayReceiver-win-x64.zip
 
-      # Every run leaves a downloadable zip on the Actions run page, even
-      # without a tag.
+      # Version shown in Programs & Features. A tag push gives e.g. "1.2.0" (or
+      # "v1.2.0"); a manual run has no version to speak of, so fall back to 0.0.0.
+      - name: Derive installer version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = '${{ github.ref_name }}' -replace '^v', ''
+          if ($v -notmatch '^\d+(\.\d+){0,3}$') { $v = '0.0.0' }
+          Write-Host "Installer version: $v"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # Inno Setup ships on the windows-latest image; install it if that changes.
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc `
+            "/DAppVersion=${{ steps.ver.outputs.version }}" `
+            "/DPublishDir=$($PWD.Path)\publish" `
+            "/DOutputDir=$($PWD.Path)" `
+            installer\AirPlayReceiver.iss
+
+      # Every run leaves both downloads on the Actions run page, even without a tag.
       - uses: actions/upload-artifact@v4
         with:
           name: AirPlayReceiver-win-x64
-          path: AirPlayReceiver-win-x64.zip
+          path: |
+            AirPlayReceiver-win-x64.zip
+            AirPlayReceiverSetup.exe
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: AirPlayReceiver-win-x64.zip
+          files: |
+            AirPlayReceiverSetup.exe
+            AirPlayReceiver-win-x64.zip
           generate_release_notes: true
