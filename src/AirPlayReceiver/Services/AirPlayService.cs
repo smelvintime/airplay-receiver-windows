@@ -50,6 +50,7 @@ public sealed class AirPlayService : IAsyncDisposable
     public async Task StartAsync(CancellationToken ct = default)
     {
         string deviceName = BuildDeviceName();
+        _window?.SetDeviceName(deviceName);
 
         // ── 0. Device identity (shared by mDNS pk and the pairing handshake) ──
         _identity = DeviceIdentity.LoadOrCreate();

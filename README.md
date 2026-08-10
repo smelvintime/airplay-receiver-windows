@@ -30,6 +30,8 @@ Either way, on first launch:
    (video), plus a few per-session ports the firewall allow covers. It won't be
    discoverable if you decline.
 3. On your iPhone: open Control Center → **Screen Mirroring** → pick your PC.
+   Not sure which entry is yours? The receiver window shows the exact name it
+   advertises ("Discoverable in Screen Mirroring as …").
 
 Press **F11** or double-click the window to toggle fullscreen.
 

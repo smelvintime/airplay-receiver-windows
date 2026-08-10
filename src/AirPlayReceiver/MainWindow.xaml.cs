@@ -144,6 +144,21 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
+    /// Called by AirPlayService once the advertised AirPlay name is known, so
+    /// the idle overlay shows exactly which entry to pick in the iPhone's
+    /// Screen Mirroring list. Thread-safe: dispatches to the UI thread.
+    /// </summary>
+    public void SetDeviceName(string name)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            DeviceNameText.Text = name;
+            DiscoverableAsText.Visibility = Visibility.Visible;
+            _appWindow.Title = $"AirPlay Receiver — {name}";
+        });
+    }
+
+    /// <summary>
     /// Called by VideoDecoder to update the HUD text (resolution, codec, fps).
     /// </summary>
     public void UpdateHud(string text)
