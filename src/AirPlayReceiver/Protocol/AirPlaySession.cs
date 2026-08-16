@@ -61,6 +61,15 @@ public sealed class AirPlaySession : IAsyncDisposable
     // tears mirroring down after the response is on the wire.
     private bool _mirroringTeardownPending;
 
+    // Stream types in a SETUP/TEARDOWN "streams" array.
+    private const long StreamTypeMirrorVideo = 110;
+    private const long StreamTypeAudio       = 96;
+
+    // Set by HandleTeardown when the phone retired individual streams rather
+    // than the whole session; the read loop stops just those once the response
+    // is on the wire, and the session stays up.
+    private List<long>? _pendingStreamTeardown;
+
     // Set when a response carried Connection: close (playback ended or failed).
     // The read loop drops the socket once that response has been written.
     private bool _closeAfterResponse;
@@ -168,7 +177,15 @@ public sealed class AirPlaySession : IAsyncDisposable
                     await StopStreamAsync();
                 }
 
-                if (msg.Method == "TEARDOWN")
+                // A TEARDOWN that named individual streams retires only those; the
+                // session — and mirroring with it — carries on, so the read loop
+                // must not fall through to the session teardown below.
+                if (_pendingStreamTeardown is { } retiring)
+                {
+                    _pendingStreamTeardown = null;
+                    await StopStreamsAsync(retiring);
+                }
+                else if (msg.Method == "TEARDOWN")
                 {
                     _teardownReceived = true;
                     break;
@@ -858,7 +875,7 @@ public sealed class AirPlaySession : IAsyncDisposable
                 long type = stream.TryGetValue("type", out var t) && t is long tl ? tl : -1;
                 Log.Info("Setup", $"phase 2: stream type={type}");
 
-                if (type == 110) // video mirroring
+                if (type == StreamTypeMirrorVideo) // video mirroring
                 {
                     if (stream.TryGetValue("streamConnectionID", out var c) && c is long cl)
                     {
@@ -900,11 +917,11 @@ public sealed class AirPlaySession : IAsyncDisposable
 
                     responseStreams.Add(new Dictionary<string, object?>
                     {
-                        ["type"]     = (long)110,
+                        ["type"]     = StreamTypeMirrorVideo,
                         ["dataPort"] = (long)_mirror.Port,
                     });
                 }
-                else if (type == 96) // screen-mirroring audio (AAC-ELD over UDP/RTP)
+                else if (type == StreamTypeAudio) // screen-mirroring audio (AAC-ELD over UDP/RTP)
                 {
                     // iOS retries this SETUP until it gets a data/control port, so
                     // open the audio receiver once and reuse its ports on retries.
@@ -924,7 +941,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
                     responseStreams.Add(new Dictionary<string, object?>
                     {
-                        ["type"]        = (long)96,
+                        ["type"]        = StreamTypeAudio,
                         ["dataPort"]    = (long)_audio.DataPort,
                         ["controlPort"] = (long)_audio.ControlPort,
                     });
@@ -1117,6 +1134,21 @@ public sealed class AirPlaySession : IAsyncDisposable
     {
         Log.Info("RTSP", "TEARDOWN received.");
 
+        // TEARDOWN is symmetric with SETUP: a "streams" array names the streams to
+        // retire and everything else stays up; no "streams" key means the session
+        // itself is over. iOS adds an audio stream when mirrored audio starts and
+        // retires it — alone — when that audio stops, so treating every TEARDOWN
+        // as a session teardown dropped mirroring a few seconds after any sound
+        // played. Only the whole-session form may end the session.
+        List<long>? retiring = ParseTeardownStreams(msg);
+        if (retiring is not null)
+        {
+            // Stopping a receiver is async; the read loop does it once this
+            // response is on the wire, as it does for the /play path.
+            _pendingStreamTeardown = retiring;
+            return BuildOk(msg.CSeq);
+        }
+
         // A photo session has no /stop verb — TEARDOWN is the only unambiguous
         // "the user is done" signal, so this is where the surface is cleared and
         // the asset cache dropped. Deliberately not in RunAsync's finally: iOS
@@ -1141,6 +1173,58 @@ public sealed class AirPlaySession : IAsyncDisposable
         }
 
         return BuildOk(msg.CSeq);
+    }
+
+    /// <summary>
+    /// Reads a TEARDOWN's body and returns the stream types it names, or
+    /// <c>null</c> when it names none — the whole-session form. A body that is
+    /// not a plist, or that we cannot parse, is treated as whole-session: that
+    /// is the older, safer reading, and getting it wrong the other way would
+    /// leave a session running that the phone believes is gone.
+    /// </summary>
+    private static List<long>? ParseTeardownStreams(RtspMessage msg)
+    {
+        byte[] body = msg.Body ?? Array.Empty<byte>();
+        if (body.Length < 8 || Encoding.ASCII.GetString(body, 0, 8) != "bplist00")
+        {
+            Log.Info("RTSP", $"TEARDOWN scope: whole-session (body {body.Length}B, not a binary plist)");
+            return null;
+        }
+
+        object? parsed;
+        try { parsed = BinaryPlist.Parse(body); }
+        catch (Exception ex)
+        {
+            Log.Info("RTSP", $"TEARDOWN scope: whole-session (body {body.Length}B did not parse: {ex.Message})");
+            return null;
+        }
+
+        if (parsed is not Dictionary<string, object?> root
+            || !root.TryGetValue("streams", out var streamsObj)
+            || streamsObj is not List<object?> streams
+            || streams.Count == 0)
+        {
+            Log.Info("RTSP", $"TEARDOWN scope: whole-session (no streams array, body {body.Length}B)");
+            return null;
+        }
+
+        var types = new List<long>();
+        foreach (object? streamObj in streams)
+            if (streamObj is Dictionary<string, object?> stream
+                && stream.TryGetValue("type", out var t) && t is long type)
+                types.Add(type);
+
+        if (types.Count == 0)
+        {
+            // A streams array we cannot read is not a licence to keep the session
+            // alive — fall back to the whole-session reading.
+            Log.Info("RTSP", $"TEARDOWN scope: whole-session ({streams.Count} stream(s) with no readable type)");
+            return null;
+        }
+
+        Log.Info("RTSP", $"TEARDOWN scope: per-stream ({string.Join(", ", types.Select(t => $"type={t}"))}) " +
+                         "— session stays up");
+        return types;
     }
 
     private byte[] HandleGetProperty(RtspMessage msg)
@@ -1441,6 +1525,45 @@ public sealed class AirPlaySession : IAsyncDisposable
 
     private static byte[] BuildOk(int cseq)
         => RtspMessage.BuildResponse(200, "OK", cseq);
+
+    /// <summary>
+    /// Retires the individual streams a per-stream TEARDOWN named, leaving the
+    /// rest of the session standing: the control connection, the event and
+    /// timing channels, the reverse channels and any stream not listed.
+    /// </summary>
+    private async Task StopStreamsAsync(IReadOnlyList<long> types)
+    {
+        foreach (long type in types)
+        {
+            switch (type)
+            {
+                case StreamTypeAudio:
+                    if (_audio is not null)
+                    {
+                        await _audio.DisposeAsync();
+                        _audio = null;
+                        Log.Info("Audio", "stream retired by TEARDOWN — mirroring continues");
+                    }
+                    break;
+
+                case StreamTypeMirrorVideo:
+                    if (_mirror is not null)
+                    {
+                        await _mirror.StopAsync();
+                        _mirror = null;
+                        Log.Info("Mirror", "stream retired by TEARDOWN");
+                    }
+                    // The idle overlay follows RECORD, not this stream, and the
+                    // session is still recording — so StreamStopped stays unfired
+                    // and the last frame holds until the session really ends.
+                    break;
+
+                default:
+                    Log.Info("RTSP", $"TEARDOWN named stream type={type}, which we never set up — ignoring");
+                    break;
+            }
+        }
+    }
 
     private async Task StopStreamAsync()
     {
