@@ -193,14 +193,81 @@ public sealed class AirPlayService : IAsyncDisposable
         await _rtsp.StartAsync(ct);
 
         // ── 5. mDNS advertisement ─────────────────────────────────────────────
+        _deviceName = deviceName;
         _mdns = new MdnsService(deviceName, _identity.PublicKeyHex, port: 7000);
         await _mdns.StartAsync(ct);
+
+        // Sleep/wake, DHCP renewal, switching Wi-Fi: the responder's sockets and
+        // address records are bound to what the network looked like at startup.
+        System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
 
         Log.Info("AirPlay", $"Service started. Advertising as '{deviceName}'");
     }
 
+    // ── Discovery refresh ─────────────────────────────────────────────────────
+
+    private string? _deviceName;
+    private readonly SemaphoreSlim _mdnsGate = new(1, 1);
+    private int _netChangePending;
+
+    /// <summary>
+    /// Rebuilds the mDNS responder from scratch — fresh sockets, fresh address
+    /// records — and announces again. With <paramref name="goodbye"/> (the manual
+    /// "refresh" button) phones are first told to forget us, so the picker entry is
+    /// re-created rather than merely refreshed. Never says goodbye mid-session.
+    /// </summary>
+    public async Task RefreshDiscoveryAsync(string reason, bool goodbye)
+    {
+        if (_identity is null || _deviceName is null) return;   // not started yet
+        if (!await _mdnsGate.WaitAsync(0)) return;              // a refresh is already running
+        try
+        {
+            MdnsService? old = _mdns;
+            bool active = old?.SessionActive ?? false;
+            Log.Info("AirPlay", $"Refreshing discovery ({reason}; goodbye={goodbye && !active}; session={(active ? "active" : "idle")})");
+
+            if (old is not null)
+            {
+                if (goodbye && !active) old.SendGoodbye();
+                await old.DisposeAsync();
+            }
+
+            // ponytail: a session start/stop landing during this swap updates the old
+            // responder and is lost; flags self-correct on the next transition.
+            var fresh = new MdnsService(_deviceName, _identity.PublicKeyHex, port: 7000);
+            await fresh.StartAsync();
+            if (active) fresh.SetSessionActive(true);
+            _mdns = fresh;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("AirPlay", $"Discovery refresh ({reason}) failed", ex);
+        }
+        finally
+        {
+            _mdnsGate.Release();
+        }
+    }
+
+    private void OnNetworkAddressChanged(object? sender, EventArgs e)
+    {
+        // These arrive in bursts; coalesce and let DHCP settle before rebuilding.
+        if (Interlocked.Exchange(ref _netChangePending, 1) == 1) return;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            Interlocked.Exchange(ref _netChangePending, 0);
+            await RefreshDiscoveryAsync("network change", goodbye: false);
+        });
+    }
+
     public async Task StopAsync()
     {
+        System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
+        // Don't race a refresh that is mid-swap. Never released — we're exiting —
+        // hence the timeout, so a second StopAsync can't hang.
+        await _mdnsGate.WaitAsync(TimeSpan.FromSeconds(5));
+        _deviceName = null;            // any refresh queued behind us becomes a no-op
         if (_mdns    is not null) await _mdns.StopAsync();
         if (_rtsp    is not null) await _rtsp.StopAsync();
         if (_decoder is not null) await _decoder.StopAsync();

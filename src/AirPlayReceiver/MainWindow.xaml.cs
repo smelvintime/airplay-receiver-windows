@@ -42,6 +42,21 @@ public sealed partial class MainWindow : Window
     /// <summary>Raised when the user chooses Exit from the tray menu (real shutdown).</summary>
     public event Action? ExitRequested;
 
+    /// <summary>Raised by the idle-screen button and the tray menu: re-broadcast our availability to phones.</summary>
+    public event Action? RefreshRequested;
+
+    private async void RefreshButton_Click(object sender, RoutedEventArgs e)
+    {
+        RefreshRequested?.Invoke();
+
+        // Feedback only — and a few seconds of debounce against button mashing.
+        RefreshButton.IsEnabled = false;
+        RefreshButton.Content   = "Signal sent — reopen Screen Mirroring on your phone";
+        await System.Threading.Tasks.Task.Delay(4000);
+        RefreshButton.Content   = "Refresh visibility on phones";
+        RefreshButton.IsEnabled = true;
+    }
+
     /// <summary>Raised when the window is closed during a live session — end it (disconnect the phone).</summary>
     public event Action? SessionEndRequested;
 
@@ -87,7 +102,8 @@ public sealed partial class MainWindow : Window
         // AirPlay service keeps advertising. Only the tray's Exit shuts down.
         IntPtr hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         string iconPath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
-        _tray = new TrayIcon(hwnd, "AirPlay Receiver", iconPath, ShowFromTray, RequestExit);
+        _tray = new TrayIcon(hwnd, "AirPlay Receiver", iconPath, ShowFromTray,
+                             () => RefreshRequested?.Invoke(), RequestExit);
 
         _appWindow.Closing += OnAppWindowClosing;
     }
