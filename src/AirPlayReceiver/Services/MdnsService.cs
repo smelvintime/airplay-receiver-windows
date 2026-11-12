@@ -2,6 +2,7 @@ using Makaretu.Dns;
 using Makaretu.Dns.Resolving;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -148,8 +149,25 @@ public sealed class MdnsService : IAsyncDisposable
         _deviceId     = GetMacAddress();
         _publicKeyHex = publicKeyHex;
 
-        _mdns = new MulticastService();
+        // Bind only to real LAN adapters. Unfiltered, Makaretu also joins Hyper-V /
+        // WSL virtual switches and we advertise their 172.x addresses, which no
+        // phone can reach.
+        _mdns = new MulticastService(nics => LanInterfaces(nics));
         _sd   = new ServiceDiscovery(_mdns);
+    }
+
+    /// <summary>True while the advertised flags say a session is receiving.</summary>
+    public bool SessionActive => Volatile.Read(ref _sessionActive) == 1;
+
+    /// <summary>
+    /// Sends a goodbye (TTL=0) for both services so phones drop their cached entry.
+    /// Only used by an explicit refresh, which re-advertises from a fresh responder
+    /// straight afterwards — the point is to make iOS re-evaluate us from scratch.
+    /// </summary>
+    public void SendGoodbye()
+    {
+        AnnounceProfile(_airplayProfile, "goodbye", goodbye: true);
+        AnnounceProfile(_raopProfile,    "goodbye", goodbye: true);
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -165,8 +183,13 @@ public sealed class MdnsService : IAsyncDisposable
         //  our response; seeing none points to firewall/network/subnet isolation.)
         _mdns.NetworkInterfaceDiscovered += (_, e) =>
         {
+            // The event reports every new adapter; the sockets only use the
+            // filtered set, so log that.
+            var lan = LanInterfaces().Select(n => n.Id).ToHashSet();
             foreach (var nic in e.NetworkInterfaces)
-                Log.Info("mDNS", $"Listening on interface: {nic.Name}");
+                Log.Info("mDNS", lan.Contains(nic.Id)
+                    ? $"Listening on interface: {nic.Name}"
+                    : $"Ignoring non-LAN interface: {nic.Name}");
         };
 
         // Per-query logging was invaluable while bringing discovery up, but iOS
@@ -291,7 +314,8 @@ public sealed class MdnsService : IAsyncDisposable
         var airplayProfile = new ServiceProfile(
             instanceName: _deviceName,
             serviceName:  "_airplay._tcp",
-            port:         (ushort)_port
+            port:         (ushort)_port,
+            addresses:    LanAddresses()
         );
 
         AddTxt(airplayProfile, "deviceid",  _deviceId);
@@ -323,7 +347,8 @@ public sealed class MdnsService : IAsyncDisposable
         var raopProfile = new ServiceProfile(
             instanceName: raopInstance,
             serviceName:  "_raop._tcp",
-            port:         (ushort)_port
+            port:         (ushort)_port,
+            addresses:    LanAddresses()
         );
 
         // RAOP TXT keys (subset relevant to screen mirroring). Real Apple TVs
@@ -445,9 +470,12 @@ public sealed class MdnsService : IAsyncDisposable
     /// records. The service-type PTR is a shared record and must NOT carry the
     /// cache-flush bit; SRV/TXT/A/AAAA are unique to this instance and must.
     /// </summary>
-    private void AnnounceProfile(ServiceProfile? profile, string reason)
+    private void AnnounceProfile(ServiceProfile? profile, string reason, bool goodbye = false)
     {
         if (profile is null || !_running) return;
+
+        // RFC 6762 §10.1: a goodbye is the same records with TTL 0.
+        TimeSpan Ttl(TimeSpan ttl) => goodbye ? TimeSpan.Zero : ttl;
 
         try
         {
@@ -457,7 +485,7 @@ public sealed class MdnsService : IAsyncDisposable
             {
                 Name       = profile.QualifiedServiceName,
                 DomainName = profile.FullyQualifiedName,
-                TTL        = SharedRecordTtl,
+                TTL        = Ttl(SharedRecordTtl),
             });
 
             foreach (ResourceRecord r in profile.Resources)
@@ -473,7 +501,7 @@ public sealed class MdnsService : IAsyncDisposable
                             // half-written one.
                             Strings = new List<string>(txt.Strings),
                             Class   = CacheFlushIn,
-                            TTL     = txt.TTL,
+                            TTL     = Ttl(txt.TTL),
                         });
                         break;
 
@@ -486,7 +514,7 @@ public sealed class MdnsService : IAsyncDisposable
                             Port     = srv.Port,
                             Target   = srv.Target,
                             Class    = CacheFlushIn,
-                            TTL      = srv.TTL,
+                            TTL      = Ttl(srv.TTL),
                         });
                         break;
 
@@ -509,7 +537,7 @@ public sealed class MdnsService : IAsyncDisposable
 
                         AddressRecord copy = AddressRecord.Create(addr.Name, addr.Address);
                         copy.Class = CacheFlushIn;
-                        copy.TTL   = addr.TTL;
+                        copy.TTL   = Ttl(addr.TTL);
                         msg.Answers.Add(copy);
                     }
                 }
@@ -613,19 +641,81 @@ public sealed class MdnsService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Returns the MAC address of the first non-loopback, active Ethernet or
-    /// Wi-Fi adapter. Used as the AirPlay device identifier.
+    /// Adapters a phone can actually reach us on: up, not loopback/tunnel, and with
+    /// a default gateway. The gateway test is what excludes Hyper-V / WSL / VPN
+    /// host-only virtual switches. Falls back to every up adapter when none has a
+    /// gateway (an isolated network), so discovery never ends up with nothing.
+    /// </summary>
+    private static List<NetworkInterface> LanInterfaces(IEnumerable<NetworkInterface>? nics = null)
+    {
+        var up = (nics ?? NetworkInterface.GetAllNetworkInterfaces())
+            .Where(n => n.OperationalStatus == OperationalStatus.Up &&
+                        n.NetworkInterfaceType is not (NetworkInterfaceType.Loopback
+                                                    or NetworkInterfaceType.Tunnel))
+            .ToList();
+
+        var routed = up
+            .Where(n => n.GetIPProperties().GatewayAddresses
+                         .Any(g => !g.Address.Equals(IPAddress.Any) &&
+                                   !g.Address.Equals(IPAddress.IPv6Any)))
+            .ToList();
+
+        return routed.Count > 0 ? routed : up;
+    }
+
+    /// <summary>
+    /// The IPv4 and IPv6 link-local addresses of <see cref="LanInterfaces"/> — what
+    /// goes into our A/AAAA records. Null (Makaretu's own default) if there are none.
+    /// </summary>
+    private static List<IPAddress>? LanAddresses()
+    {
+        var addrs = LanInterfaces()
+            .SelectMany(n => n.GetIPProperties().UnicastAddresses)
+            .Select(u => u.Address)
+            .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork || a.IsIPv6LinkLocal)
+            .ToList();
+
+        Log.Info("mDNS", $"Advertising addresses: {(addrs.Count > 0 ? string.Join(", ", addrs) : "(Makaretu default)")}");
+        return addrs.Count > 0 ? addrs : null;
+    }
+
+    /// <summary>
+    /// The AirPlay device identifier, MAC-style. Chosen once from a real LAN
+    /// adapter and then persisted: iOS keys the receiver on this value, and
+    /// re-deriving it each run let it flip to a Hyper-V virtual adapter's MAC
+    /// depending on adapter enumeration order — a "new" device with the same name.
     /// </summary>
     public static string GetMacAddress()
     {
-        foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
-        {
-            if (nic.OperationalStatus != OperationalStatus.Up)
-                continue;
-            if (nic.NetworkInterfaceType is NetworkInterfaceType.Loopback
-                                         or NetworkInterfaceType.Tunnel)
-                continue;
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AirPlayReceiver", "device_id.txt");
 
+        try
+        {
+            if (File.Exists(path))
+            {
+                string saved = File.ReadAllText(path).Trim();
+                if (System.Text.RegularExpressions.Regex.IsMatch(saved, "^([0-9A-F]{2}:){5}[0-9A-F]{2}$"))
+                    return saved;
+            }
+        }
+        catch (Exception ex) { Log.Warn("mDNS", $"Failed to load device id: {ex.Message}"); }
+
+        string id = DeriveMacAddress();
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, id);
+        }
+        catch (Exception ex) { Log.Warn("mDNS", $"Failed to persist device id: {ex.Message}"); }
+        return id;
+    }
+
+    private static string DeriveMacAddress()
+    {
+        foreach (NetworkInterface nic in LanInterfaces())
+        {
             byte[] macBytes = nic.GetPhysicalAddress().GetAddressBytes();
             if (macBytes.Length == 6)
                 return string.Join(":", macBytes.Select(b => b.ToString("X2")));

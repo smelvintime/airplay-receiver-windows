@@ -36,6 +36,7 @@ public sealed class TrayIcon : IDisposable
 
     private const int IDM_OPEN = 1;
     private const int IDM_EXIT = 2;
+    private const int IDM_REFRESH = 3;
 
     // ── State ─────────────────────────────────────────────────────────────────
     private readonly IntPtr        _hwnd;
@@ -43,14 +44,16 @@ public sealed class TrayIcon : IDisposable
     private readonly SUBCLASSPROC  _subclassProc; // kept alive against GC
     private readonly Action        _onOpen;
     private readonly Action        _onExit;
+    private readonly Action        _onRefresh;
     private IntPtr _hIcon;
     private bool   _added;
     private bool   _disposed;
 
-    public TrayIcon(IntPtr hwnd, string tooltip, string iconPath, Action onOpen, Action onExit)
+    public TrayIcon(IntPtr hwnd, string tooltip, string iconPath, Action onOpen, Action onRefresh, Action onExit)
     {
         _hwnd   = hwnd;
         _onOpen = onOpen;
+        _onRefresh = onRefresh;
         _onExit = onExit;
 
         _hIcon = LoadImage(IntPtr.Zero, iconPath, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
@@ -88,6 +91,7 @@ public sealed class TrayIcon : IDisposable
                 switch ((int)(wParam.ToInt64() & 0xFFFF))
                 {
                     case IDM_OPEN: _onOpen(); return IntPtr.Zero;
+                    case IDM_REFRESH: _onRefresh(); return IntPtr.Zero;
                     case IDM_EXIT: _onExit(); return IntPtr.Zero;
                 }
                 break;
@@ -99,6 +103,7 @@ public sealed class TrayIcon : IDisposable
     {
         IntPtr menu = CreatePopupMenu();
         AppendMenu(menu, MF_STRING, IDM_OPEN, "Open AirPlay Receiver");
+        AppendMenu(menu, MF_STRING, IDM_REFRESH, "Refresh visibility on phones");
         AppendMenu(menu, MF_STRING, IDM_EXIT, "Exit");
 
         GetCursorPos(out POINT pt);

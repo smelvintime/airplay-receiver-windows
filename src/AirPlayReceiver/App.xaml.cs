@@ -70,6 +70,7 @@ public partial class App : Application
         _window = new MainWindow();
         _window.ExitRequested += OnExitRequested;
         _window.SessionEndRequested += () => _airPlayService?.EndActiveSessions();
+        _window.RefreshRequested    += () => _ = _airPlayService?.RefreshDiscoveryAsync("user request", goodbye: true);
         _window.Activate();
 
         // When launched at sign-in, come up hidden in the system tray so the
